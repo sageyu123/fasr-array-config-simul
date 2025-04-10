@@ -5,6 +5,7 @@ from scipy.special import j1
 from scipy.constants import c
 import os
 from casatools import vpmanager, quanta
+from scipy.stats import binned_statistic
 
 qa = quanta()
 vp = vpmanager()
@@ -417,26 +418,38 @@ def plot_all_panels0(positions, title):
 
 
 
-def plot_all_panels(positions, title='', labels = [], frequency=2, nyq_sample=None, figname=None, array_config_str=None):
+def plot_all_panels1(positions, title='', labels=[], frequency=2, nyq_sample=None,
+                    figname=None, array_config_str=None, psf_mode='profile'):
     """
-    Plot antenna positions, UV coverage, and (optionally) PSF or UV density.
+    Plot antenna positions, UV coverage, and (optionally) PSF or UV sampling density.
 
     If the input is a single 2D NumPy array (shape (N,2)), it is interpreted as one
-    antenna configuration, and a 2x3 layout (including the PSF panel) is used.
+    antenna configuration, and a 2x3 layout (including a PSF panel) is used.
 
-    If the input is a list (or tuple) of 2D NumPy arrays, each array is treated as a separate
-    configuration and a 2x2 layout (without the PSF panel) is produced, with each configuration
-    overplotted in the panels.
+    If the input is a list/tuple of 2D NumPy arrays, each array is treated as a separate
+    configuration and a 2x2 layout (without the PSF panel) is produced.
+
+    In single-set mode, if psf_mode == 'image', the PSF panel shows the 2D PSF image.
+    If psf_mode == 'profile', the PSF panel shows the averaged radial profile
+    (mean intensity versus radius in arcsec).
 
     Parameters:
       positions : numpy.ndarray or list/tuple of numpy.ndarray
           Either a single array of shape (N,2) or a list of such arrays.
       title : str, optional
           Title text for the plots.
+      labels : list, optional
+          List of labels for multiple configurations.
       frequency : float, optional
-          Frequency in GHz (used only when a single array is provided for the PSF panel).
+          Frequency in GHz (used for PSF calculation in single-set mode).
       nyq_sample : dict or None, optional
-          Dictionary of Nyquist sampling rates to plot horizontal reference lines in the density plot.
+          Dictionary of Nyquist sampling rates to draw horizontal reference lines in the density plot.
+      figname : str or None, optional
+          If provided, saves the figure with this filename.
+      array_config_str : str or None, optional
+          If provided, displays this text at the upper center of the figure.
+      psf_mode : str, optional
+          Either 'image' or 'profile'; in single-set mode, determines how to display the PSF.
 
     Returns:
       fig, axes : tuple
@@ -509,8 +522,9 @@ def plot_all_panels(positions, title='', labels = [], frequency=2, nyq_sample=No
         padded_size = grid_size * 8
         u_min, u_max = np.min(uv[:, 0]), np.max(uv[:, 0])
         v_min, v_max = np.min(uv[:, 1]), np.max(uv[:, 1])
-        H, xedges, yedges = np.histogram2d(uv[:, 0], uv[:, 1], bins=grid_size, range=[[u_min, u_max], [v_min, v_max]])
-        # Compute the PSF via FFT of the sampling grid
+        H, xedges, yedges = np.histogram2d(uv[:, 0], uv[:, 1],
+                                           bins=grid_size,
+                                           range=[[u_min, u_max], [v_min, v_max]])
         psf = np.abs(np.fft.fftshift(np.fft.fft2(H, s=(padded_size, padded_size))))
         # Convert the uv grid (meters) to image plane coordinates in arcsec
         # First, compute the wavelength (m) from the input frequency (GHz)
@@ -523,13 +537,37 @@ def plot_all_panels(positions, title='', labels = [], frequency=2, nyq_sample=No
         pixel_scale_arcsec = pixel_scale_rad * 206265
         # Total field-of-view (FOV) in arcsec:
         fov_arcsec = padded_size * pixel_scale_arcsec
-        extent = [-fov_arcsec / 2, fov_arcsec / 2, -fov_arcsec / 2, fov_arcsec / 2]
-        im = ax_psf.imshow(psf, extent=extent, origin='lower', aspect='equal', cmap='viridis')
-        ax_psf.set_xlim(-1000, 1000)
-        ax_psf.set_ylim(-1000, 1000)
-        ax_psf.set_xlabel("RA [arcsec]")
-        ax_psf.set_ylabel("DEC [arcsec])")
-        # fig.colorbar(im, ax=ax_psf, fraction=0.046, pad=0.04)
+        extent = [-fov_arcsec/2, fov_arcsec/2, -fov_arcsec/2, fov_arcsec/2]
+
+        if psf_mode == 'image':
+            im_psf = ax_psf.imshow(psf, extent=extent, origin='lower', aspect='equal', cmap='viridis')
+            ax_psf.set_xlabel("RA [arcsec]")
+            ax_psf.set_ylabel("DEC [arcsec]")
+            # plt.colorbar(im_psf, ax=ax_psf)
+        elif psf_mode == 'profile':
+            # Compute the averaged radial profile of the PSF.
+            # Create a grid of indices and calculate the radius from the center.
+            y_idx, x_idx = np.indices(psf.shape)
+            center = (psf.shape[0] // 2, psf.shape[1] // 2)
+            r = np.sqrt((x_idx - center[1])**2 + (y_idx - center[0])**2)
+            # Use binned_statistic to average the intensity in radial bins.
+            bin_size = 1  # in pixels
+            max_r = int(np.ceil(r.max()))
+            bins = np.arange(0, max_r + bin_size, bin_size)
+            from scipy.stats import binned_statistic
+            radial_mean, bin_edges, _ = binned_statistic(r.ravel(), psf.ravel(), statistic='mean', bins=bins)
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            # Convert the radial bin centers to arcseconds.
+            x_axis_arcsec = bin_centers * pixel_scale_arcsec
+            ax_psf.plot(x_axis_arcsec, radial_mean/np.nanmax(radial_mean), '-')
+            ax_psf.set_xlabel("Radius [arcsec]")
+            ax_psf.set_ylabel("PSF intensity")
+            ax_psf.set_xscale('log')
+            # ax_psf.set_yscale('log')
+            ax_psf.set_title(f"PSF Radial Profile ({frequency:.1f} GHz)")
+            ax_psf.set_aspect('auto')
+        else:
+            raise ValueError("psf_mode must be either 'image' or 'profile'")
 
         # Panel 4 (bottom row, spanning all columns): UV Sampling Density vs. UV Distance
         ax_uvdensity = fig.add_subplot(gs[1, :])
@@ -554,7 +592,7 @@ def plot_all_panels(positions, title='', labels = [], frequency=2, nyq_sample=No
         #     ax_uvdensity.grid(True)
 
         gs.tight_layout(fig)
-        gs.update(hspace=0.0)
+        # gs.update(hspace=0.0)
         # return fig, (ax_ant, ax_uvcov, ax_psf, ax_uvdensity)
         # If more than one positions array is provided, use new 2x2 layout (no PSF panel).
         if array_config_str is not None:
@@ -563,8 +601,8 @@ def plot_all_panels(positions, title='', labels = [], frequency=2, nyq_sample=No
             figname = f'fig-layout_{title.replace(" ","_")}-{len(pos_list[0])}.jpg'
         fig.savefig(figname, dpi=300)
     else:
-        fig = plt.figure(figsize=(8, 8))
-        gs = gridspec.GridSpec(2, 2, height_ratios=[3, 1])
+        fig = plt.figure(figsize=(12, 8))
+        gs = gridspec.GridSpec(2, 3, height_ratios=[3, 1])
 
         colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
@@ -627,6 +665,236 @@ def plot_all_panels(positions, title='', labels = [], frequency=2, nyq_sample=No
         fig.savefig(figname, dpi=300)
         # return fig, (ax_ant, ax_uvcov, ax_uvdensity)
 
+
+def radial_profile(psf, bin_size=1):
+    """
+    Compute the averaged radial profile of a 2D image (psf).
+
+    Parameters:
+      psf : 2D numpy.ndarray
+          Input image.
+      bin_size : int, optional
+          Bin size in pixels (default is 1).
+
+    Returns:
+      bin_centers : numpy.ndarray
+          Centers of the radial bins (in pixels).
+      radial_mean : numpy.ndarray
+          Mean value in each radial bin.
+    """
+    y_idx, x_idx = np.indices(psf.shape)
+    center = (psf.shape[0] // 2, psf.shape[1] // 2)
+    r = np.sqrt((x_idx - center[1])**2 + (y_idx - center[0])**2)
+    max_r = int(np.ceil(r.max()))
+    bins = np.arange(0, max_r + bin_size, bin_size)
+    radial_mean, bin_edges, _ = binned_statistic(r.ravel(), psf.ravel(), statistic='mean', bins=bins)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    return bin_centers, radial_mean
+
+def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None,
+                    figname=None, array_config_str=None, psf_mode='uprofile'):
+    """
+    Plot antenna positions, UV coverage, PSF, and UV sampling density in a 2x3 layout.
+
+    The function accepts either a single antenna configuration (a 2D numpy array of shape (N,2))
+    or a list/tuple of such arrays. In either case the layout is 2x3:
+      - Top-left: Antenna Layout (overplotted if multiple sets).
+      - Top-center: UV Coverage (overplotted for each set).
+      - Top-right: PSF panel. For a single configuration:
+            If psf_mode=='image', displays the 2D PSF;
+            If psf_mode=='rprofile' (or 'profile'), displays the averaged radial profile;
+            If psf_mode=='uprofile', displays the profile along the central row;
+            If psf_mode=='vprofile', displays the profile along the central column.
+      - Bottom (spanning all columns): UV Sampling Density (overplotted for each set).
+
+    Global text (array_config_str) is placed at the top-center of the figure.
+
+    Parameters:
+      positions : numpy.ndarray or list/tuple of numpy.ndarray
+          Either a single 2D array (shape (N,2)) or a list/tuple of such arrays.
+      title : str, optional
+          Title text for the plots.
+      labels : list, optional
+          Labels for each configuration (if multiple).
+      frequency : float, optional
+          Frequency in GHz (used for PSF calculation).
+      nyq_sample : dict or None, optional
+          Dictionary of Nyquist sampling rates for the density plot.
+      figname : str or None, optional
+          If provided, the figure is saved with this filename.
+      array_config_str : str or None, optional
+          Global configuration text to display at the top-center of the figure.
+      psf_mode : str, optional
+          Either 'image', 'rprofile' (alias 'profile'), 'uprofile', or 'vprofile'.
+          In multiple-set mode the PSF mode is forced to be 'uprofile'.
+
+    Returns:
+      fig, axes : tuple
+          The Matplotlib figure and a tuple of axis objects.
+    """
+    import matplotlib.gridspec as gridspec
+    # Convert the input to a list of 2D arrays.
+    if isinstance(positions, np.ndarray):
+        if positions.ndim == 2:
+            pos_list = [positions]
+        else:
+            raise ValueError("If 'positions' is a numpy array, it must be 2D with shape (N,2).")
+    elif isinstance(positions, (list, tuple)):
+        pos_list = []
+        for pos in positions:
+            if not (isinstance(pos, np.ndarray) and pos.ndim == 2):
+                raise ValueError("Each element in 'positions' must be a 2D numpy array with shape (N,2).")
+            pos_list.append(pos)
+    else:
+        raise ValueError("'positions' must be either a 2D numpy array or a list/tuple of such arrays.")
+
+    # If there is more than one configuration, force psf_mode to 'profile'
+    npos = len(pos_list)
+    if npos > 1:
+        psf_mode = 'uprofile'
+
+    # Create a 2x3 layout using GridSpec.
+    fig = plt.figure(figsize=(12, 8))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[3, 1])
+
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+    # Panel 1 (top-left): Antenna Layout.
+    ax_ant = fig.add_subplot(gs[0, 0])
+    ax_ant.set_title(f"{title} - Antenna Layout")
+    for idx, pos in enumerate(pos_list):
+        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
+        ax_ant.plot(pos[:, 0], pos[:, 1], 'o', label=lab, color=colors[idx % len(colors)])
+    ax_ant.set_xlabel("X [m]")
+    ax_ant.set_ylabel("Y [m]")
+    ax_ant.set_aspect('equal')
+    if npos > 1:
+        ax_ant.legend()
+
+    # Global figure text at the top center.
+    if array_config_str is not None:
+        fig.text(0.5, 0.98, array_config_str, ha='center', va='top', fontsize=12,
+                 bbox=dict(facecolor='white', alpha=0.5, edgecolor='gray'))
+
+    # Panel 2 (top-middle): UV Coverage.
+    ax_uvcov = fig.add_subplot(gs[0, 1])
+    ax_uvcov.set_title(f"{title} - UV Coverage")
+    for idx, pos in enumerate(pos_list):
+        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
+        uv = compute_uv_coverage(pos)
+        ax_uvcov.plot(uv[:, 0], uv[:, 1], '.', markersize=1, label=lab, color=colors[idx % len(colors)])
+    ax_uvcov.set_xlabel("u [m]")
+    ax_uvcov.set_ylabel("v [m]")
+    ax_uvcov.set_aspect('equal')
+    if npos > 1:
+        ax_uvcov.legend()
+
+    # Panel 3 (top-right): PSF.
+    ax_psf = fig.add_subplot(gs[0, 2])
+    ax_psf.set_title(f"PSF ({frequency:.1f} GHz)")
+    # For each configuration, compute the PSF from its UV coverage.
+    # Use the following procedure for each set:
+    #  - Compute uv = compute_uv_coverage(pos)
+    #  - Define grid parameters for a 2D histogram: grid_size and padded_size.
+    #  - Compute H, then the PSF via FFT.
+    #  - Compute pixel scale from frequency.
+    #  - Convert the PSF to either a 2D image (if psf_mode=='image') or compute its averaged radial profile (if psf_mode=='profile').
+    grid_size = 128
+    padded_size = grid_size * 8
+    psf_profiles = []
+    for idx, pos in enumerate(pos_list):
+        uv = compute_uv_coverage(pos)
+        # Use the min/max of uv for each configuration.
+        u_min, u_max = np.min(uv[:, 0]), np.max(uv[:, 0])
+        v_min, v_max = np.min(uv[:, 1]), np.max(uv[:, 1])
+        H, xedges, yedges = np.histogram2d(uv[:, 0], uv[:, 1], bins=grid_size,
+                                           range=[[u_min, u_max], [v_min, v_max]])
+        psf = np.abs(np.fft.fftshift(np.fft.fft2(H, s=(padded_size, padded_size))))
+
+        # Compute pixel scale in arcsec:
+        C_LIGHT = 3e8
+        lambda_m = C_LIGHT / (frequency * 1e9)
+        pixel_scale_rad = (grid_size * lambda_m) / ((u_max - u_min) * padded_size)
+        pixel_scale_arcsec = pixel_scale_rad * 206265
+        fov_arcsec = padded_size * pixel_scale_arcsec
+        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
+
+        if psf_mode == 'image':
+            im_psf = ax_psf.imshow(psf, extent=[-fov_arcsec/2, fov_arcsec/2, -fov_arcsec/2, fov_arcsec/2],
+                                   origin='lower', aspect='equal', cmap='viridis', alpha=1)
+            ax_psf.set_xlabel("RA [arcsec]")
+            ax_psf.set_ylabel("DEC [arcsec]")
+            # If desired, add a colorbar here.
+            # plt.colorbar(im_psf, ax=ax_psf)
+        elif psf_mode == 'rprofile' or psf_mode == 'profile':
+            # Compute the averaged radial profile.
+            y_idx, x_idx = np.indices(psf.shape)
+            center = (psf.shape[0] // 2, psf.shape[1] // 2)
+            r = np.sqrt((x_idx - center[1])**2 + (y_idx - center[0])**2)
+            bin_size = 1  # pixel bin size
+            max_r = int(np.ceil(r.max()))
+            bins_r = np.arange(0, max_r + bin_size, bin_size)
+            radial_mean, bin_edges, _ = binned_statistic(r.ravel(), psf.ravel(), statistic='mean', bins=bins_r)
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            r_arcsec = bin_centers * pixel_scale_arcsec
+            ax_psf.plot(r_arcsec, radial_mean/np.nanmax(radial_mean), '-', color=colors[idx % len(colors)], label=lab)
+            ax_psf.set_xscale('log')
+            ax_psf.set_yscale('log')
+            ax_psf.set_xlabel("Radius [arcsec]")
+            ax_psf.set_ylabel("Normalized PSF intensity")
+            ax_psf.legend()
+        elif psf_mode == 'uprofile':
+            center_y = psf.shape[0] // 2
+            profile = psf[center_y, :]
+            x_axis = np.linspace(-fov_arcsec/2, fov_arcsec/2, psf.shape[1])
+            ax_psf.plot(x_axis, profile/np.nanmax(profile), '-', color=colors[idx % len(colors)], label=lab)
+            ax_psf.set_xscale('log')
+            ax_psf.set_yscale('log')
+            ax_psf.set_xlabel("U [arcsec]")
+            ax_psf.set_ylabel("Normalized PSF intensity")
+            ax_psf.legend()
+        elif psf_mode == 'vprofile':
+            center_x = psf.shape[1] // 2
+            profile = psf[:, center_x]
+            y_axis = np.linspace(-fov_arcsec/2, fov_arcsec/2, psf.shape[0])
+            ax_psf.plot(y_axis, profile/np.nanmax(profile), '-', color=colors[idx % len(colors)], label=lab)
+            ax_psf.set_xscale('log')
+            ax_psf.set_yscale('log')
+            ax_psf.set_xlabel("V [arcsec]")
+            ax_psf.set_ylabel("Normalized PSF intensity")
+            ax_psf.legend()
+        else:
+            raise ValueError("psf_mode must be 'image', 'rprofile' (or 'profile'), 'uprofile', or 'vprofile'")
+
+
+    # Panel 4 (bottom row, spanning all columns): UV Sampling Density.
+    ax_uvdensity = fig.add_subplot(gs[1, :])
+    ax_uvdensity.set_title("UV Sampling Density")
+    for idx, pos in enumerate(pos_list):
+        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
+        uv = compute_uv_coverage(pos)
+        uv_dist = np.sqrt(uv[:, 0]**2 + uv[:, 1]**2)
+        binwidth = 10
+        bins_uv = np.arange(0, np.max(uv_dist) + binwidth, binwidth)
+        counts, bin_edges = np.histogram(uv_dist, bins=bins_uv)
+        bin_centers = 0.5*(bin_edges[:-1] + bin_edges[1:])
+        ax_uvdensity.step(bin_centers, counts, where='mid', label=lab, color=colors[idx % len(colors)])
+    ax_uvdensity.set_xlabel("UV Distance [m]")
+    ax_uvdensity.set_ylabel(f"Density (counts/per {binwidth:d} m)")
+    if nyq_sample is not None:
+        ls = ['--', ':', '-.', '-']
+        for j, (k, v) in enumerate(nyq_sample.items()):
+            ax_uvdensity.axhline(v, ls=ls[j % len(ls)], color='gray', label=f'Nyquist rate ({k})')
+    ax_uvdensity.set_yscale('log')
+    if npos > 1:
+        ax_uvdensity.legend()
+
+    gs.tight_layout(fig)
+    # gs.update(hspace=0.0)
+
+    # Save the figure if a filename is provided.
+    if figname is not None:
+        fig.savefig(figname, dpi=300)
 
 def geodetic_to_ecef(lon, lat, h):
     """
