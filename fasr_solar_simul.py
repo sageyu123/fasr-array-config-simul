@@ -1544,7 +1544,7 @@ def equivalent_amp_pha_error(phaerr: float, unit: str = 'deg') -> tuple[float, f
 
     return float(phase_pct)/100, float(amp_pct)/100
 
-def generate_caltb(msfile, caltype=['ph','amp', 'mbd'], calerr=[0.05, 0.05, 0.01], caltbdir='./'):
+def generate_caltb(msfile, caltype=['ph', 'amp', 'mbd'], calerr=[0.05, 0.05, 0.01], caltbdir='./'):
     '''
     Generate CASA calibration tables (caltb) to corrupt the visibilities in a Measurement Set (MS) by assuming potential errors in the calibration.
     Default to generate phase (ph), amplitude (amp), and multi-band delay (mhd) calibration tables.
@@ -2020,9 +2020,16 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     radius_pix = int(960*1.2 / pixscale_x)  # masking out 1.2 Rsun
     y, x = np.ogrid[-ics:shape1 - ics, -ics:shape1 - ics]
     mask = x * x + y * y <= radius_pix * radius_pix
+    ics2 = int(shape2 / 2)
+    radius_pix2 = int(960*1.2 / pixscale_x2)  # masking out 1.2 Rsun
+    y2, x2 = np.ogrid[-ics2:shape2 - ics2, -ics2:shape2 - ics2]
+    mask2 = x2 * x2 + y2 * y2 <= radius_pix2 * radius_pix2
     pix1_masked = np.copy(pix1)
     pix1_masked[mask] = np.nan
     cropped1_rms = np.sqrt(np.nanmean(pix1_masked**2))
+    pix2_masked = np.copy(pix2)
+    pix2_masked[mask2] = np.nan
+    cropped2_rms = np.sqrt(np.nanmean(pix2_masked**2))
     # Crop the corner of the image to calculate RMS for SNR estimation
     #crop_fraction_rms = (0.9, 1.0)
     #p1_rms = int(shape1 * crop_fraction_rms[0])
@@ -2031,10 +2038,12 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     datamax2 = np.nanmax(pix2)
     #cropped1_rms = pix1[p1_rms:p2_rms, p1_rms:p2_rms]
     rms1 = np.sqrt(np.nanmean(cropped1_rms**2))
+    rms2 = np.sqrt(np.nanmean(cropped2_rms**2))
     print(f'Peak of {os.path.basename(image1_filename)}: {np.nanmax(pix1):.3e} K')
     print(f'rms of {os.path.basename(image1_filename)} (excluding solar disk): {rms1:.3e} K')
     snr1 = datamax1 / rms1
-    print(f'SNR of the image: {snr1:.1f}')
+    snr2 = datamax2 / rms2
+    print(f'SNR of the image: {snr1:.1f}; Dynamic range of the model: {snr2:.1f}')
     # snr2 = signal2 / np.nanstd(pix2[p1_rms:p2_rms, p1_rms:p2_rms])
     if isinstance(crop_fraction[0], float):
         pbl1 = int(shape1 * crop_fraction[0])
@@ -2136,6 +2145,8 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     ax2.set_ylabel('Declination')
     ax2.set_title(title2)
     ax2.text(0.98, 0.02, r'T$_{Bmax}$'+f': {datamax2:.1e} K', transform=ax2.transAxes, ha='right',
+             va='bottom', color='white', fontsize=legend_size)
+    ax2.text(0.98, 0.05, f'D range: {snr2:.1f}', transform=ax2.transAxes, ha='right',
              va='bottom', color='white', fontsize=legend_size)
     ax2.text(0.98, 0.98, freqstr, transform=ax2.transAxes, ha='right',
              va='top', color='white', fontsize=legend_size)
