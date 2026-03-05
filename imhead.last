@@ -1,0 +1,6 @@
+imagename = 'FASR/msfiles/flare/fasr_fasr-a_random_spiral_hybrid_120_flare_05.15GHz_20170910T19UT_dur1s_int1s_noise5000K_uniform_multiscale.image'
+mode      = 'summary'
+hdkey     = ''
+hdvalue   = ''
+verbose   = False
+#imhead( imagename='FASR/msfiles/flare/fasr_fasr-a_random_spiral_hybrid_120_flare_05.15GHz_20170910T19UT_dur1s_int1s_noise5000K_uniform_multiscale.image',mode='summary',hdkey='',hdvalue='',verbose=False )
