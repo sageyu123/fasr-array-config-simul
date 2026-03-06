@@ -2572,8 +2572,8 @@ def convolve_model_image_with_template(model_image, template_image, output_model
     return output_model
 
 def fidelity_evaluation(restored_image, model_image, fidelity_image=None,
-                        doconvolve=True, rms_mask_radius=1.2, n_bins=50, sigma_jy=None,
-                        solar_radius_arcsec=960., do_plot=True, figsize=(12, 5), fontsize=8):
+                        doconvolve=True, rms_mask_radius=1.2, n_bins=50, sigma_jy=None, vmin=None, vmax=None,
+                        solar_radius_arcsec=960., do_plot=True, figsize=(12, 5), fontsize=8, xlim=None, ylim=None):
     """
     Performs the convolution and calculates the Fidelity Map.
 
@@ -2621,7 +2621,7 @@ def fidelity_evaluation(restored_image, model_image, fidelity_image=None,
     restored_data = ia.getchunk()
     csys0 = ia.coordsys()
     cs0_rec = csys0.torecord()
-    pixscale_x = np.degrees(csys0.increment()['numeric'][0]) * 3600.  # arcsec
+    pixscale_x = -np.degrees(csys0.increment()['numeric'][0]) * 3600.  # arcsec
     pixscale_y = np.degrees(csys0.increment()['numeric'][1]) * 3600.  # arcsec
     s = ia.summary()
     bunit = ia.summary()['unit']
@@ -2697,12 +2697,24 @@ def fidelity_evaluation(restored_image, model_image, fidelity_image=None,
         ax0.set_title('Fidelity Image')
         ax0.set_xlabel('Solar X (arcsec)')
         ax0.set_ylabel('Solar Y (arcsec)')
-        plt.colorbar(im0)
+        if xlim is not None:
+            ax0.set_xlim(xlim)
+        if ylim is not None:
+            ax0.set_ylim(ylim)
+        plt.colorbar(im0, ax=ax0, label='Fidelity')
 
         ax1 = axs[1]
         model_data_2d = model_data[:, :, 0, 0] * jybm2k# assume shape [nx, ny, 1, 1]
+        if vmax is None:
+            vmax = 90.
+        if vmin is None:
+            snr = peak / noise_floor
+            vmin = -1000 / snr # set the minimum to -10 * rms (expressed in percentage)
+            print(f'Estimated noise sigma from the restored image: {vmin:.2f} K')
+        vmax_val = np.nanmax(model_data_2d) * float(vmax) / 100
+        vmin_val = np.nanmax(model_data_2d) * float(vmin) / 100
         im1 = ax1.imshow(model_data_2d.transpose(), origin='lower', cmap='hinodexrt',
-                         vmin=np.nanpercentile(model_data_2d, 1), vmax=np.nanpercentile(model_data_2d, 99), extent=extent)
+                         vmin=vmin_val, vmax=vmax_val, extent=extent)
         ax1.text(0.98, 0.98, f'{freqhz / 1e9:.1f} GHz', color='white', fontsize=fontsize,
                  ha='right', va='top', transform=ax1.transAxes)
         rms_circle2 = Circle((0.0, 0.0), rms_radius_arcsec,
@@ -2712,6 +2724,10 @@ def fidelity_evaluation(restored_image, model_image, fidelity_image=None,
         ax1.set_title('Convolved Model Image')
         ax1.set_xlabel('Solar X (arcsec)')
         ax1.set_ylabel('Solar Y (arcsec)')
+        if xlim is not None:
+            ax1.set_xlim(xlim)
+        if ylim is not None:
+            ax1.set_ylim(ylim)
         cbar = plt.colorbar(im1, ax=ax1, label=r'T$_B$ [K]')
         cticks = cbar.ax.get_yticks()
         ctick_labels = [f'{tick:.0e}' for tick in cticks]
@@ -2854,11 +2870,12 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
                                           crop_fraction=(0.0, 1.0), rms_mask_radius=1.2, reftime=None,
                                           figsize=(12, 5),
                                           image_meta={'freq': '', 'title': ['', ''], 'array_config': ''},
-                                          compare_two=False,
+                                          overlay_contours=False,
                                           contour_levels=None, cmap='viridis',
                                           conv_tag='',
                                           overwrite_conv=True, vmax=None, vmin=None,
-                                          vmax2=None, vmin2=None, fontsize=8, legend_size=6):
+                                          vmax2=None, vmin2=None, fontsize=8, legend_size=6,
+                                          xlim=None, ylim=None):
     """
     Open two CASA images using casatools.image (IA), convolve the second image
     with the restoring beam from the first image, and plot them side-by-side.
@@ -2907,8 +2924,6 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     dur = image_meta.get('duration', None)
     bandwidth = image_meta.get('bandwidth', None)
     weighting = image_meta.get('weighting', None)
-    if not compare_two:
-        figsize = (figsize[0] / 3 * 2, figsize[1])
     # --- Read image1 (restored image) ---
     img1 = read_casa_image_data(image1_filename)
     beam = img1['beam']
@@ -2969,19 +2984,13 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     rms_radius_arcsec = solar_radius_asec * rms_mask_radius
 
     # --- Plotting: Create a figure with two panels using the WCS projection from image1 ---
-    if compare_two:
-        #fig, axs = plt.subplots(1, 3, figsize=figsize,
-        #                        subplot_kw={'projection': w})
-        fig, axs = plt.subplots(1, 2, figsize=figsize)
-    else:
-        #fig, axs = plt.subplots(1, 2, figsize=figsize,
-        #                        subplot_kw={'projection': w})
-        fig, axs = plt.subplots(1, 2, figsize=figsize)
+
+    fig, axs = plt.subplots(1, 2, figsize=figsize)
 
     if vmax is None:
         vmax = 90  # 90% of the maximum
     if vmin is None:
-        vmin = -1000 / snr1  # set the minimum to 10 * rms (expressed in percentage)
+        vmin = -1000 / snr1  # set the minimum to -10 * rms (expressed in percentage)
     vmax_val = np.nanmax(cropped1) * float(vmax) / 100
     vmin_val = np.nanmax(cropped1) * float(vmin) / 100
     print(f'Plotting image with vmin={vmin_val:.3e} K, vmax={vmax_val:.3e} K')
@@ -3011,6 +3020,10 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     ax1.add_patch(rms_circle1)
     ax1.set_xlabel('Solar X (arcsec)')
     ax1.set_ylabel('Solar Y (arcsec)')
+    if xlim is not None:
+        ax1.set_xlim(xlim)
+    if ylim is not None:
+        ax1.set_ylim(ylim)
     ax1.set_title(title1)
     ax1.text(0.98, 0.01, r'$\sigma_I$' + f': {sigma_jy}, ' + r'$\sigma_T$' + f': {sigma_tb:.1e}K',
              transform=ax1.transAxes, ha='right', va='bottom', color='white', fontsize=legend_size)
@@ -3076,6 +3089,10 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
              va='bottom', color='white', fontsize=legend_size)
     ax2.text(0.98, 0.98, freqstr, transform=ax2.transAxes, ha='right',
              va='top', color='white', fontsize=legend_size)
+    if xlim is not None:
+        ax2.set_xlim(xlim)
+    if ylim is not None:
+        ax2.set_ylim(ylim)
     # set ax2's xy limit to the same as ax1
     #ax2.set_xlim(ax1.get_xlim())
     #ax2.set_ylim(ax1.get_ylim())
@@ -3088,7 +3105,7 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     cbar.ax.set_yticklabels(ctick_labels)
 
     # Overlay contours from image1 onto the right panel.
-    if compare_two:
+    if overlay_contours:
         ax_comp = axs[1]
         im2 = ax_comp.imshow(cropped2.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
                              vmax=vmax_val2, vmin=vmin_val2)
