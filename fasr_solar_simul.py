@@ -223,6 +223,96 @@ def get_max_resolution(freq, max_baseline):
     return res  # in arcsec
 
 
+def resolve_casa_image_path(path_hint):
+    """Resolve a CASA image path from a base name or `.image` path."""
+    if path_hint is None:
+        return None
+    candidates = [
+        path_hint,
+        path_hint + '.image',
+        path_hint[:-6] if str(path_hint).endswith('.image') else None,
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def humanize_array_config_label(cfg_file):
+    """Return a compact display label for a FASR config filename."""
+    base = os.path.basename(str(cfg_file)).replace('.cfg', '')
+    parts = base.split('_')
+    lower = [p.lower() for p in parts]
+    if 'hybrid' in lower and '120' in lower:
+        remote_count = next((p[6:] for p in lower if p.startswith('remote') and len(p) > 6), None)
+        range_token = next((p for p in lower if p.startswith('r') and p.endswith('km') and '-' in p), None)
+        if remote_count and range_token:
+            range_label = range_token[1:].replace('km', ' km').replace('-', '–')
+            return f'Hybrid 120 + {remote_count} remote ({range_label})'
+        return 'Hybrid 120'
+    return base
+
+
+def base_tag_from_path(path):
+    """Return a stable basename tag for CASA image or FITS-like paths."""
+    return os.path.basename(str(path)).replace('.image', '').replace('.im', '')
+
+
+def crop_fraction_tag(crop_fraction):
+    """Return a filename-safe tag describing a crop tuple."""
+    if isinstance(crop_fraction[0], float):
+        return f"crop{int(crop_fraction[0] * 100):02d}-{int(crop_fraction[1] * 100):02d}"
+    if isinstance(crop_fraction[0], (tuple, list)):
+        return (
+            f"cropx{int(crop_fraction[0][0] * 100):02d}-{int(crop_fraction[0][1] * 100):02d}"
+            f"_y{int(crop_fraction[1][0] * 100):02d}-{int(crop_fraction[1][1] * 100):02d}"
+        )
+    return 'cropfull'
+
+
+def freqstr_to_hz(freqstr):
+    """Parse a frequency string like `05.15GHz` into Hz."""
+    s = str(freqstr).strip().lower()
+    if s.endswith('ghz'):
+        return float(s[:-3]) * 1e9
+    if s.endswith('mhz'):
+        return float(s[:-3]) * 1e6
+    if s.endswith('khz'):
+        return float(s[:-3]) * 1e3
+    if s.endswith('hz'):
+        return float(s[:-2])
+    raise ValueError(f'Unrecognized frequency string: {freqstr}')
+
+
+def remove_path(path):
+    """Remove a file or directory if it exists."""
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def clear_casa_imagename(imagename_base):
+    """Remove CASA image sidecar products for a given base name."""
+    for path in glob.glob(imagename_base + '.*'):
+        remove_path(path)
+
+
+def casa_safe_scales(scales):
+    """Return CASA-safe integer multiscale list."""
+    try:
+        values = np.atleast_1d(scales).tolist()
+    except Exception:
+        values = [0, 6, 20]
+    out = []
+    for value in values:
+        try:
+            out.append(int(round(float(value))))
+        except Exception:
+            continue
+    return out if out else [0, 6, 20]
+
+
 def calc_noise(tsys, array_config_file, dish_diameter=None, total_flux=None, duration=10., integration_time=1.,
                channel_width_mhz=10., nchannel=1, eta_q=0.93, eta_a=0.6, freqghz='1GHz', uv_cell=None, verbose=False):
     """
@@ -2142,6 +2232,434 @@ def generate_caltb(msfile, caltype=['ph', 'amp', 'mbd'], calerr=[0.05, 0.05, 0.0
     return gaintable
 
 
+def boost_long_baseline_weights(ms_in, ms_out, freqstr, uv0_klambda=30, power=2.0, max_boost=50.0,
+                                uvrange_min_klambda=0.0):
+    """Create a copy of an MS and reweight rows by UV distance."""
+    from casatools import table as tbtool
+
+    if os.path.exists(ms_out):
+        print('MS already exists, skipping copy:', ms_out)
+    else:
+        print('Copying MS ->', ms_out)
+        shutil.copytree(ms_in, ms_out)
+
+    lam_m = 3e8 / freqstr_to_hz(freqstr)
+
+    tb = tbtool()
+    tb.open(ms_out, nomodify=False)
+    try:
+        uvw = tb.getcol('UVW')
+        u_m, v_m = uvw[0, :], uvw[1, :]
+        uv_kl = (np.sqrt(u_m * u_m + v_m * v_m) / lam_m) / 1e3
+
+        boost = (np.maximum(uv_kl, uvrange_min_klambda) / float(uv0_klambda)) ** float(power)
+        boost = np.where(uv_kl >= uvrange_min_klambda, boost, 1.0)
+        boost = np.clip(boost, 1.0, float(max_boost))
+
+        for col, op in [('WEIGHT', 'mul'), ('SIGMA', 'divsqrt')]:
+            if col not in tb.colnames():
+                continue
+            arr = tb.getcol(col)
+            if arr.ndim == 1:
+                if op == 'mul':
+                    arr = arr * boost
+                else:
+                    arr = arr / np.sqrt(boost)
+            elif arr.ndim == 2:
+                if arr.shape[1] == boost.size:
+                    if op == 'mul':
+                        arr = arr * boost[None, :]
+                    else:
+                        arr = arr / np.sqrt(boost[None, :])
+                elif arr.shape[0] == boost.size:
+                    if op == 'mul':
+                        arr = arr * boost[:, None]
+                    else:
+                        arr = arr / np.sqrt(boost[:, None])
+                else:
+                    raise ValueError(f'Unexpected {col} shape {arr.shape} for nrow={boost.size}')
+            else:
+                raise ValueError(f'Unexpected {col} ndim={arr.ndim}')
+            tb.putcol(col, arr)
+            print('Updated', col)
+
+        if 'WEIGHT_SPECTRUM' in tb.colnames():
+            wspec = tb.getcol('WEIGHT_SPECTRUM')
+            if wspec.ndim == 3 and wspec.shape[2] == boost.size:
+                wspec = wspec * boost[None, None, :]
+                tb.putcol('WEIGHT_SPECTRUM', wspec)
+                print('Updated WEIGHT_SPECTRUM')
+    finally:
+        tb.close()
+
+    return ms_out
+
+
+def uv_distance_m_from_ms(msfile):
+    """Return UV distance in meters for each visibility row in an MS."""
+    from casatools import table as tbtool
+
+    tb = tbtool()
+    tb.open(msfile)
+    uvw = tb.getcol('UVW')
+    tb.close()
+    u = uvw[0, :]
+    v = uvw[1, :]
+    return np.sqrt(u * u + v * v)
+
+
+def plot_uv_density_splits(msfile, cfg_label_text, thr_list, figdir, freqstr, bin_m=10.0):
+    """Plot UV-density histograms split by threshold in klambda."""
+    uvd = uv_distance_m_from_ms(msfile)
+    lam = 3e8 / freqstr_to_hz(freqstr)
+    uv_kl = uvd / lam / 1e3
+
+    max_uv = np.nanmax(uvd) if np.isfinite(np.nanmax(uvd)) else 10000.0
+    edges = np.arange(0.0, max_uv + bin_m, bin_m)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    fig, axs = plt.subplots(len(thr_list), 1, figsize=(5, 1.5 * len(thr_list)), sharex=True, sharey=True)
+    if len(thr_list) == 1:
+        axs = [axs]
+
+    for ax, thr in zip(axs, thr_list):
+        mask_short = uv_kl < thr
+        mask_long = uv_kl >= thr
+        h_short, _ = np.histogram(uvd[mask_short], bins=edges)
+        h_long, _ = np.histogram(uvd[mask_long], bins=edges)
+        ax.step(centers, h_short, where='mid', label=f'short (<{thr} klambda)', lw=1.5)
+        ax.step(centers, h_long, where='mid', label=f'long (>{thr} klambda)', lw=1.5)
+        ax.set_ylabel('Density\n(counts/10 m)')
+        ax.grid(alpha=0.3)
+        ax.legend(loc='best', fontsize=8)
+        ax.set_yscale('log')
+
+    axs[-1].set_xlabel('UV distance [m]')
+    fig.suptitle(f'UV sampling density split comparison ({cfg_label_text})', y=0.995)
+    fig.tight_layout()
+    out = os.path.join(figdir, f'fig-uv_density_split_compare_{os.path.basename(msfile).replace(".ms", "")}.jpg')
+    fig.savefig(out, dpi=200)
+    print('Saved figure:', out)
+    return out
+
+
+def plot_boost_weighting_curves(msfile, cfg_label_text, boost_grid, figdir, freqstr, max_boost,
+                                uvrange_min_klambda=0.0):
+    """Plot manual weight-boost curves against UV distance."""
+    uvd = uv_distance_m_from_ms(msfile)
+    max_uv = np.nanmax(uvd) if np.isfinite(np.nanmax(uvd)) else 10000.0
+    uvd_grid = np.linspace(0.0, max_uv, 800)
+
+    lam = 3e8 / freqstr_to_hz(freqstr)
+    uv_kl_grid = uvd_grid / lam / 1e3
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+    for uv0, pwr in boost_grid:
+        w = (np.maximum(uv_kl_grid, uvrange_min_klambda) / float(uv0)) ** float(pwr)
+        w = np.clip(w, 1.0, float(max_boost))
+        ax.plot(uvd_grid, w, lw=1.8, label=f'uv0={uv0}k, p={pwr}')
+
+    ax.set_xlabel('UV distance [m]')
+    ax.set_ylabel('Weight factor')
+    ax.set_title(f'Manual boost weighting vs UV distance ({cfg_label_text})')
+    ax.grid(alpha=0.3)
+    ax.legend(loc='best', fontsize=8)
+    fig.tight_layout()
+    out = os.path.join(figdir, f'fig-boost_weighting_curves_{os.path.basename(msfile).replace(".ms", "")}.jpg')
+    fig.savefig(out, dpi=200)
+    print('Saved figure:', out)
+    return out
+
+
+def ensure_default_calibration(msfile, phaerr, amperr, caltbdir='./', calibrated_msfile=None,
+                               overwrite=False, in_place=False):
+    """Generate and apply default phase/amplitude calibration corruption.
+
+    :param msfile: Input measurement set.
+    :type msfile: str
+    :param phaerr: Phase error in radians.
+    :type phaerr: float
+    :param amperr: Fractional amplitude error.
+    :type amperr: float
+    :param caltbdir: Directory holding calibration tables.
+    :type caltbdir: str
+    :param calibrated_msfile: Output calibrated MS path when ``in_place`` is False.
+    :type calibrated_msfile: str or None
+    :param overwrite: If True, rebuild the calibrated MS copy.
+    :type overwrite: bool
+    :param in_place: If True, apply calibration directly to ``msfile``.
+    :type in_place: bool
+    :returns: Path to the calibrated MS.
+    :rtype: str
+    """
+    from casatasks import applycal, clearcal
+
+    phaerr_deg = np.rad2deg(phaerr)
+    gaintable = [
+        f'{caltbdir}/caltb_FASR_corrupt_{phaerr_deg:.0f}deg.ph',
+        f'{caltbdir}/caltb_FASR_corrupt_{np.int_(amperr * 100)}pct.amp',
+    ]
+    if not os.path.exists(gaintable[0]) or not os.path.exists(gaintable[1]):
+        gaintable = generate_caltb(
+            msfile,
+            caltype=['ph', 'amp'],
+            calerr=[phaerr, amperr],
+            caltbdir=caltbdir,
+        )
+    if in_place:
+        calibrated_ms = msfile
+    else:
+        calibrated_ms = calibrated_msfile or msfile.replace('.ms', '_defaultcal.ms')
+        if overwrite and os.path.exists(calibrated_ms):
+            remove_path(calibrated_ms)
+        if not os.path.exists(calibrated_ms):
+            shutil.copytree(msfile, calibrated_ms)
+
+    clearcal(vis=calibrated_ms)
+    applycal(vis=calibrated_ms, gaintable=gaintable, applymode='calonly', calwt=False)
+    return calibrated_ms
+
+
+def calc_noise_terms_for_cfg(config_file, solar_model, freqstr, imsize, cell, tsys, duration,
+                             integration_time, channel_width_mhz, eta_a=0.6):
+    """Return cached-style noise terms matching notebook sensitivity calculations."""
+    antenna_params = np.genfromtxt(config_file, comments='#')
+    dish_diameter = antenna_params[0, 3]
+    uv_cell = 1. / (imsize * float(str(cell).rstrip('arcsec')) / 206265.)
+    total_flux = calc_total_flux_on_dish(solar_model, dish_diameter=dish_diameter, freqghz=freqstr)
+    tant = total_flux_to_tant(total_flux, eta_a=eta_a, dish_diameter=dish_diameter)
+    noisejy, sigma_na, sigma_un = calc_noise(
+        tsys, config_file, dish_diameter=dish_diameter,
+        total_flux=total_flux, duration=duration,
+        integration_time=integration_time,
+        channel_width_mhz=channel_width_mhz,
+        freqghz=freqstr, uv_cell=uv_cell,
+    )
+    sigma_jy = sigma_un / np.sqrt((duration / integration_time))
+    return {
+        'dish_diameter': dish_diameter,
+        'uv_cell': uv_cell,
+        'total_flux': total_flux,
+        'tant': tant,
+        'noisejy': noisejy,
+        'sigma_na': sigma_na,
+        'sigma_un': sigma_un,
+        'sigma_jy': sigma_jy,
+    }
+
+
+def boost_restoringbeam_arcsec(uv0_klambda):
+    """Compute boosted restoring beam in arcsec using 3e4/uv0 scaling."""
+    uv0_lambda = float(uv0_klambda) * 1e3
+    if uv0_lambda <= 0:
+        raise ValueError(f'uv0_klambda must be > 0, got {uv0_klambda}')
+    return (3.0 * 10e3) / uv0_lambda
+
+
+def ensure_split_feather(msfile, msname, uvthr_klambda, cell, deconvolver, scales, imsize, phasecenter,
+                         niter, overwrite_images=False, weighting='superuniform'):
+    """Create short-UV, long-UV, and feathered images for a given MS.
+
+    :param msfile: Input measurement set.
+    :type msfile: str
+    :param msname: Base product name for output images.
+    :type msname: str
+    :param uvthr_klambda: UV split threshold in klambda.
+    :type uvthr_klambda: float
+    :param cell: CASA cell size string.
+    :type cell: str
+    :param deconvolver: CASA deconvolver name.
+    :type deconvolver: str
+    :param scales: Multiscale list used by CASA.
+    :type scales: list
+    :param imsize: Image size.
+    :type imsize: int or list
+    :param phasecenter: CASA phasecenter string.
+    :type phasecenter: str
+    :param niter: CLEAN iteration limit.
+    :type niter: int
+    :param overwrite_images: If True, remove existing image products first.
+    :type overwrite_images: bool
+    :param weighting: CASA weighting passed to both split-image ``tclean`` runs.
+    :type weighting: str
+    :returns: Dict with ``short``, ``long``, and ``feather`` image paths.
+    :rtype: dict
+    """
+    from casatasks import feather, tclean
+
+    short_base = f'{msname}_uvlt{uvthr_klambda}k_{cell}_{weighting}_{deconvolver}'
+    long_base = f'{msname}_uvgt{uvthr_klambda}k_{cell}_{weighting}_{deconvolver}'
+    feather_base = f'{msname}_feather_uvthr{uvthr_klambda}k_{weighting}_{deconvolver}'
+
+    if overwrite_images:
+        for imagename in [short_base, long_base, feather_base]:
+            clear_casa_imagename(imagename)
+
+    if not os.path.exists(short_base + '.image'):
+        tclean(
+            vis=msfile, imagename=short_base, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, uvrange=f'<{uvthr_klambda}klambda',
+            niter=niter, interactive=False,
+        )
+
+    if not os.path.exists(long_base + '.image'):
+        tclean(
+            vis=msfile, imagename=long_base, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, uvrange=f'>{uvthr_klambda}klambda',
+            niter=niter, interactive=False,
+        )
+
+    short_path = short_base + '.image'
+    long_path = long_base + '.image'
+    if not os.path.exists(short_path):
+        raise FileNotFoundError(f'Short-UV image was not created: {short_path}')
+    if not os.path.exists(long_path):
+        raise FileNotFoundError(f'Long-UV image was not created: {long_path}')
+
+    feather_path = feather_base + '.image'
+    if not os.path.exists(feather_path):
+        feather(imagename=feather_path, lowres=short_path, highres=long_path, sdfactor=2.0)
+    if not os.path.exists(feather_path):
+        raise RuntimeError(f'Feather output was not created: {feather_path}. Inputs were lowres={short_path}, highres={long_path}')
+
+    return {'short': short_path, 'long': long_path, 'feather': feather_path}
+
+
+def ensure_boost_image(msfile, msname, freqstr, uv0_klambda, power, max_boost, cell, deconvolver, scales,
+                       imsize, phasecenter, niter, overwrite_ms=False, overwrite_image=False,
+                       uvrange_min_klambda=0.0, use_boost_restoringbeam=True, weighting='superuniform'):
+    """Create a boosted-weight MS/image product for a given configuration.
+
+    :param msfile: Input measurement set.
+    :type msfile: str
+    :param msname: Base product name for output images.
+    :type msname: str
+    :param freqstr: Frequency string used for UV reweighting.
+    :type freqstr: str
+    :param uv0_klambda: Characteristic UV scale in klambda.
+    :type uv0_klambda: float
+    :param power: Power-law index for baseline boosting.
+    :type power: float
+    :param max_boost: Maximum applied baseline boost.
+    :type max_boost: float
+    :param cell: CASA cell size string.
+    :type cell: str
+    :param deconvolver: CASA deconvolver name.
+    :type deconvolver: str
+    :param scales: Multiscale list used by CASA.
+    :type scales: list
+    :param imsize: Image size.
+    :type imsize: int or list
+    :param phasecenter: CASA phasecenter string.
+    :type phasecenter: str
+    :param niter: CLEAN iteration limit.
+    :type niter: int
+    :param overwrite_ms: If True, rebuild the boosted MS.
+    :type overwrite_ms: bool
+    :param overwrite_image: If True, rebuild the boosted image.
+    :type overwrite_image: bool
+    :param uvrange_min_klambda: Minimum UV range included in boost weighting.
+    :type uvrange_min_klambda: float
+    :param use_boost_restoringbeam: If True, set a custom restoring beam.
+    :type use_boost_restoringbeam: bool
+    :param weighting: CASA weighting passed to the boosted-image ``tclean`` run.
+    :type weighting: str
+    :returns: Boosted CASA image path.
+    :rtype: str
+    """
+    from casatasks import tclean
+
+    ms_boost = msfile.replace('.ms', f'_wboost_uv0{uv0_klambda}k_p{power}.ms')
+    if overwrite_ms and os.path.exists(ms_boost):
+        remove_path(ms_boost)
+
+    if not os.path.exists(ms_boost):
+        boost_long_baseline_weights(
+            ms_in=msfile, ms_out=ms_boost, freqstr=freqstr,
+            uv0_klambda=uv0_klambda, power=power, max_boost=max_boost,
+            uvrange_min_klambda=uvrange_min_klambda,
+        )
+
+    boost_base = ms_boost.replace('.ms', '') + f'_image_{weighting}_{deconvolver}'
+    if overwrite_image:
+        clear_casa_imagename(boost_base)
+
+    if not os.path.exists(boost_base + '.image'):
+        tclean_kwargs = dict(
+            vis=ms_boost, imagename=boost_base, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, niter=niter, interactive=False,
+        )
+        if use_boost_restoringbeam:
+            rb_arcsec = boost_restoringbeam_arcsec(uv0_klambda)
+            tclean_kwargs['restoringbeam'] = f'{rb_arcsec:.3f}arcsec'
+        tclean(**tclean_kwargs)
+
+    return boost_base + '.image'
+
+
+def ensure_weighting_reference(msfile, msname, weighting, deconvolver, scales, imsize, cell, phasecenter,
+                               niter, overwrite_image=False):
+    """Ensure a reference image exists for a given CASA weighting mode."""
+    from casatasks import tclean
+
+    imbase = f'{msname}_{weighting}_{deconvolver}'
+    if overwrite_image:
+        clear_casa_imagename(imbase)
+
+    if not os.path.exists(imbase + '.image'):
+        tclean(
+            vis=msfile, imagename=imbase, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, niter=niter, interactive=False,
+        )
+    return imbase + '.image'
+
+
+def plot_compare_casa_vs_model(image_path, model_path, cfg_label_text, noise_terms, image_meta_common, reftime,
+                               crop_fraction, figsize, cmap, vmax, conv_tag, image_rms_corner_size, suffix,
+                               figdir, overwrite_plot=False, extra_meta=None, show_cal_error_text=False):
+    """Plot a CASA image against a model and save the comparison figure."""
+    meta = {
+        **image_meta_common,
+        'title': [image_meta_common.get('title_left', 'Cleaned image'), 'Model (convolved)'],
+        'array_config': cfg_label_text,
+        'tant': f"{noise_terms['tant']:.0f}K",
+        'sigma_jy': f"{noise_terms['sigma_jy']:.1f}Jy/beam",
+    }
+    meta.pop('title_left', None)
+    if extra_meta:
+        meta.update(extra_meta)
+
+    fig, _ = plot_two_casa_images_with_convolution_sunpy(
+        image_path, model_path, crop_fraction=crop_fraction, reftime=reftime,
+        figsize=figsize, image_meta=meta, cmap=cmap, vmax=vmax, vmin=0.1,
+        conv_tag=conv_tag, overwrite_conv=True, rms_mask_radius=1.2,
+        image_rms_corner_size=image_rms_corner_size, coord_frame='radec',
+        match_fov=True, align_model_time_to_image=True, north_up=False,
+        apply_hpc_p_angle=False, anchor_model_wcs_to_image=True,
+        use_reftime_for_hpc=True, show_cal_error_text=show_cal_error_text,
+    )
+    plt.show()
+
+    figname = os.path.join(
+        figdir,
+        f"fig-{base_tag_from_path(image_path)}_vs_{base_tag_from_path(model_path)}_{suffix}_{crop_fraction_tag(crop_fraction)}.jpg"
+    )
+    if os.path.exists(figname) and overwrite_plot:
+        remove_path(figname)
+    if not os.path.exists(figname):
+        fig.savefig(figname, dpi=200)
+        print('Saved figure:', figname)
+    return fig, figname
+
+
 @runtime_report
 def get_local_noon_utc(cfg_path: str, date: datetime = None) -> Time:
     """
@@ -2244,7 +2762,7 @@ def calc_total_flux_on_dish(solar_model, dish_diameter=1.5, freqghz=None):
 @runtime_report
 def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_mhz=10,
                 integration_time=1., msname='fasr.ms', duration=None, tsys=300.,
-                usehourangle=True, ra_deg=None, dec_deg=None):
+                usehourangle=True, ra_deg=None, dec_deg=None, uv_cell=None):
     """
     Generate a Measurement Set (MS) using CASA's simulator tool with the solar model read from a FITS file.
 
@@ -2270,6 +2788,10 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
             Right Ascension of the source in degrees (if None, read from FITS header).
       dec_deg: float or None
             Declination of the source in degrees (if None, read from FITS header).
+      uv_cell : float or None
+            UV cell size in wavelengths passed through to ``calc_noise`` so the
+            MS corruption noise uses the same weighting-grid assumption as any
+            precomputed sensitivity estimate in the notebook.
 
     Returns:
       None; the MS is generated and saved under msname.
@@ -2313,7 +2835,8 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
     else:
         freq_GHz = freqghz
 
-    total_flux = calc_total_flux_on_dish(solar_model, dish_diameter=np.min(dish_dia), freqghz=freq_GHz)
+    dish_diameter = float(np.min(dish_dia))
+    total_flux = calc_total_flux_on_dish(solar_model, dish_diameter=dish_diameter, freqghz=freq_GHz)
 
     # Read source RA and DEC from CRVAL1 and CRVAL2 (in degrees) and convert to radians.
     if ra_deg is None:
@@ -2381,7 +2904,7 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
 
     sm.setdata(spwid=chosen_index)
     # Use the solar model FITS image as the sky model for prediction.
-    dishdiam = np.min(dish_dia)
+    dishdiam = dish_diameter
     vprec = vp.setpbairy(telescope='FASR', dishdiam='{0:.1f}m'.format(dishdiam),
                          blockagediam='0.5m', maxrad='{0:.3f}deg'.format(np.degrees(1.22 * 3e8 / (1e9 * dishdiam))),
                          reffreq=freq_GHz, dopb=True)
@@ -2411,14 +2934,16 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
 
     sm.openfromms(msname)
     if tsys is None:
+        print("No Tsys provided, skipping noise corruption.")
         pass
         # sm.setnoise(mode='tsys-atm', trx=500)
     else:
-        noisejy, sigma_na, sigma_un = calc_noise(tsys, config_file, dish_diameter=np.min(dish_dia),
+        noisejy, sigma_na, sigma_un = calc_noise(tsys, config_file, dish_diameter=dish_diameter,
                                                  total_flux=total_flux, duration=duration,
                                                  integration_time=integration_time, channel_width_mhz=channel_width_mhz,
-                                                 freqghz=freq_GHz)
+                                                 freqghz=freq_GHz, uv_cell=uv_cell)
         sm.setnoise(mode='simplenoise', simplenoise=f'{noisejy:.2f}Jy')
+        print(f'Corrupting the visibilities with a noise level of {noisejy:.2f} Jy (Tsys={tsys} K)')
         sm.corrupt()
     sm.done()
     print("Simulation complete. Measurement set generated:", msname)
@@ -3291,6 +3816,7 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
                                                  vmax=None,
                                                  norm_vmin_abs=None,
                                                  norm_vmax_abs=None,
+                                                 show_cal_error_text=False,
                                                  return_prepared=False):
     """Plot two CASA images with SunPy maps after convolving image2 to image1 beam.
 
@@ -3359,6 +3885,9 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
     :param hpc_xy_shift: Common post-conversion shift ``(dx, dy)`` in arcsec
         applied to both HPC maps before FOV matching/cropping.
     :type hpc_xy_shift: tuple
+    :param show_cal_error_text: If True, include the calibration-error text
+        line in the left-panel annotation block. Default is False.
+    :type show_cal_error_text: bool
     :returns: Figure and axes.
     :rtype: tuple
     :raises ValueError: If ``coord_frame`` is not supported.
@@ -3525,7 +4054,10 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
     image_list = [str(p) for p in image1_filename] if isinstance(image1_filename, (list, tuple)) else [str(image1_filename)]
     if len(image_list) == 0:
         raise ValueError('image1_filename list is empty')
-    if not return_prepared:
+    # Multi-image layout wrapper: only use when more than one image is provided.
+    # Keep single-image calls on the stable path below so panel titles from
+    # image_meta are preserved.
+    if not return_prepared and len(image_list) > 1:
         if len(image_list) > 1 and convolve_model:
             raise ValueError('Multi-image mode only supports convolve_model=False')
 
@@ -3573,6 +4105,7 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
                 vmax=vmax,
                 norm_vmin_abs=None,
                 norm_vmax_abs=None,
+                show_cal_error_text=show_cal_error_text,
                 return_prepared=True,
             )
 
@@ -3644,7 +4177,7 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
             bx = x0 + 0.06 * (x1 - x0) + 0.5 * bw
             by = y0 + 0.06 * (y1 - y0) + 0.5 * bh
             ax.add_patch(Ellipse((bx, by), width=bw, height=bh, angle=beam_angle,
-                                 edgecolor='white', facecolor='none', lw=2.0))
+                                 edgecolor='none', facecolor='white', lw=0.0))
 
         txt_kw = dict(color='white', fontsize=legend_size)
 
@@ -3659,8 +4192,9 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
                 f'Array cfg: {prep["array_config_text"]}',
                 f'Dur: {prep["dur"]}, Band: {prep["bandwidth"]}',
                 r'T$_{sys}$' + f': {prep["tsys"]}, ' + r'T$_{ant}$' + f': {prep["tant"]}',
-                f'Cal err: {prep["cal_error"]}',
             ]
+            if show_cal_error_text:
+                lt1.append(f'Cal err: {prep["cal_error"]}')
             for j, txt in enumerate(lt1):
                 ax.text(0.02, 0.98 - j * 0.06, txt, transform=ax.transAxes, ha='left', va='top', **txt_kw)
             rb1 = [
@@ -4068,7 +4602,7 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
         bx = x0 + 0.06 * (x1 - x0) + 0.5 * bw
         by = y0 + 0.06 * (y1 - y0) + 0.5 * bh
         ax.add_patch(Ellipse((bx, by), width=bw, height=bh, angle=beam_angle,
-                             edgecolor='white', facecolor='none', lw=2.0))
+                             edgecolor='none', facecolor='white', lw=0.0))
 
     ax1.set_title(title1)
     ax2.set_title(title2)
@@ -4101,8 +4635,9 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
         f'Array cfg: {array_config_text}',
         f'Dur: {dur}, Band: {bandwidth}',
         r'T$_{sys}$' + f': {tsys}, ' + r'T$_{ant}$' + f': {tant}',
-        f'Cal err: {cal_error}',
     ]
+    if show_cal_error_text:
+        lt1.append(f'Cal err: {cal_error}')
     ytop = 0.98
     dyt = 0.06
     for i, txt in enumerate(lt1):
@@ -4121,12 +4656,9 @@ def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename
                  ha='right', va='bottom', **txt_kw)
     ax2.text(0.98, 0.98, freqstr_plot, transform=ax2.transAxes, ha='right', va='top', **txt_kw)
 
-    cbar1 = plt.colorbar(im1, ax=ax1, label=r'T$_B$ [K]')
-    ticks1 = cbar1.ax.get_yticks()
-    cbar1.ax.set_yticklabels([f'{t:.0e}' for t in ticks1])
-    cbar2 = plt.colorbar(im2, ax=ax2, label=r'T$_B$ [K]')
-    ticks2 = cbar2.ax.get_yticks()
-    cbar2.ax.set_yticklabels([f'{t:.0e}' for t in ticks2])
+    cbar = fig.colorbar(im1, ax=[ax1, ax2], label=r'T$_B$ [K]', fraction=0.046, pad=0.04)
+    ticks = cbar.ax.get_yticks()
+    cbar.ax.set_yticklabels([f'{t:.0e}' for t in ticks])
 
     try:
         ax2.coords[1].set_axislabel('')
