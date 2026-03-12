@@ -34,3 +34,6 @@ msfiles/
 caltbs/*
 caltb*/
 
+## CASA task log files
+*.last
+
