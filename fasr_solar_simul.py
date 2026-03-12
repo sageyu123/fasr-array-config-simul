@@ -11,8 +11,11 @@ import matplotlib.pyplot as plt
 from scipy.special import j1
 from scipy.constants import c
 import os
+import glob
 from casatools import vpmanager, quanta
 from scipy.stats import binned_statistic
+from scipy.signal import fftconvolve
+from scipy.ndimage import shift as ndimage_shift
 import sunpy.map
 from scipy.spatial.distance import pdist
 import re
@@ -20,6 +23,7 @@ from astropy.time import Time
 from astropy.coordinates import EarthLocation, AltAz, get_sun
 import astropy.units as u
 import time
+import shutil
 from functools import wraps
 from matplotlib.patches import Ellipse, Circle
 from scipy.spatial import distance
@@ -220,6 +224,160 @@ def get_max_resolution(freq, max_baseline):
     wavelength = 299792458 / (freq * 1e9)
     res = wavelength / max_baseline * 180 / 3.14159 * 3600
     return res  # in arcsec
+
+
+def resolve_casa_image_path(path_hint):
+    """Resolve a CASA image path from a base name or `.image` path."""
+    if path_hint is None:
+        return None
+    candidates = [
+        path_hint,
+        path_hint + '.image',
+        path_hint[:-6] if str(path_hint).endswith('.image') else None,
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def humanize_array_config_label(cfg_file):
+    """Return a compact display label for a FASR config filename."""
+    base = os.path.basename(str(cfg_file)).replace('.cfg', '')
+    parts = base.split('_')
+    lower = [p.lower() for p in parts]
+    if 'hybrid' in lower and '120' in lower:
+        remote_count = next((p[6:] for p in lower if p.startswith('remote') and len(p) > 6), None)
+        range_token = next((p for p in lower if p.startswith('r') and p.endswith('km') and '-' in p), None)
+        if remote_count and range_token:
+            range_label = range_token[1:].replace('km', ' km').replace('-', '–')
+            return f'Hybrid 120 + {remote_count} remote ({range_label})'
+        return 'Hybrid 120'
+    return base
+
+
+def simple_array_config_label(cfg_file):
+    """Return a short display label for a FASR config filename.
+
+    :param cfg_file: Config filename or path.
+    :type cfg_file: str
+    :returns: Short config label without remote-range details.
+    :rtype: str
+    """
+    base = os.path.basename(str(cfg_file)).replace('.cfg', '')
+    parts = base.split('_')
+    lower = [p.lower() for p in parts]
+    if 'hybrid' in lower and '120' in lower:
+        remote_count = next((p[6:] for p in lower if p.startswith('remote') and len(p) > 6), None)
+        if remote_count:
+            return f'Hybrid 120 + {remote_count} remote'
+        return 'Hybrid 120'
+    return base
+
+
+def base_tag_from_path(path):
+    """Return a stable basename tag for CASA image or FITS-like paths."""
+    return os.path.basename(str(path)).replace('.image', '').replace('.im', '')
+
+
+def crop_fraction_tag(crop_fraction):
+    """Return a filename-safe tag describing a crop tuple."""
+    if isinstance(crop_fraction[0], float):
+        return f"crop{int(crop_fraction[0] * 100):02d}-{int(crop_fraction[1] * 100):02d}"
+    if isinstance(crop_fraction[0], (tuple, list)):
+        return (
+            f"cropx{int(crop_fraction[0][0] * 100):02d}-{int(crop_fraction[0][1] * 100):02d}"
+            f"_y{int(crop_fraction[1][0] * 100):02d}-{int(crop_fraction[1][1] * 100):02d}"
+        )
+    return 'cropfull'
+
+
+def freqstr_to_hz(freqstr):
+    """Parse a frequency string like `05.15GHz` into Hz."""
+    s = str(freqstr).strip().lower()
+    if s.endswith('ghz'):
+        return float(s[:-3]) * 1e9
+    if s.endswith('mhz'):
+        return float(s[:-3]) * 1e6
+    if s.endswith('khz'):
+        return float(s[:-3]) * 1e3
+    if s.endswith('hz'):
+        return float(s[:-2])
+    raise ValueError(f'Unrecognized frequency string: {freqstr}')
+
+
+def remove_path(path):
+    """Remove a file or directory if it exists."""
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def clear_casa_imagename(imagename_base):
+    """Remove CASA image sidecar products for a given base name."""
+    for path in glob.glob(imagename_base + '.*'):
+        remove_path(path)
+
+
+def clear_casa_imagename_if_shape_mismatch(imagename_base, imsize):
+    """Remove CASA image sidecars when the existing image shape does not match.
+
+    :param imagename_base: CASA imagename base without extension.
+    :type imagename_base: str
+    :param imsize: Requested CASA image size.
+    :type imsize: int or list or tuple
+    :returns: True if stale products were removed, else False.
+    :rtype: bool
+    """
+    probe_paths = [
+        imagename_base + ext
+        for ext in ('.image', '.psf', '.residual', '.model', '.pb', '.mask')
+    ]
+    existing_probe = next((p for p in probe_paths if os.path.exists(p)), None)
+    if existing_probe is None:
+        return False
+
+    if isinstance(imsize, (list, tuple, np.ndarray)):
+        if len(imsize) == 0:
+            return False
+        expected_shape = tuple(int(v) for v in np.atleast_1d(imsize)[:2])
+        if len(expected_shape) == 1:
+            expected_shape = (expected_shape[0], expected_shape[0])
+    else:
+        expected_shape = (int(imsize), int(imsize))
+
+    ia_local = IA()
+    try:
+        ia_local.open(existing_probe)
+        actual_shape = tuple(int(v) for v in ia_local.shape()[:2])
+    except Exception:
+        return False
+    finally:
+        try:
+            ia_local.close()
+        except Exception:
+            pass
+
+    if actual_shape != expected_shape:
+        clear_casa_imagename(imagename_base)
+        return True
+    return False
+
+
+def casa_safe_scales(scales):
+    """Return CASA-safe integer multiscale list."""
+    try:
+        values = np.atleast_1d(scales).tolist()
+    except Exception:
+        values = [0, 6, 20]
+    out = []
+    for value in values:
+        try:
+            out.append(int(round(float(value))))
+        except Exception:
+            continue
+    return out if out else [0, 6, 20]
 
 
 def calc_noise(tsys, array_config_file, dish_diameter=None, total_flux=None, duration=10., integration_time=1.,
@@ -1813,6 +1971,9 @@ This script:
   - Simulates an observation and predicts visibilities using the FITS file as the sky model.
 """
 
+from astropy.coordinates import SkyCoord, EarthLocation
+from sunpy.coordinates import frames, sun
+
 
 def make_diskmodel_from_mhd(modeldir='../fasr_sim/skymodels/quiet_sun/',
                             npzfile='psi_mhd_20201126_0.2-2GHz_emission_maps.npz',
@@ -1822,6 +1983,7 @@ def make_diskmodel_from_mhd(modeldir='../fasr_sim/skymodels/quiet_sun/',
     import sunpy
     from casatools import image
     from astropy.time import Time
+
 
     ia = image()
     f = np.load(modeldir + '/' + npzfile)
@@ -2137,6 +2299,453 @@ def generate_caltb(msfile, caltype=['ph', 'amp', 'mbd'], calerr=[0.05, 0.05, 0.0
     return gaintable
 
 
+def boost_long_baseline_weights(ms_in, ms_out, freqstr, uv0_klambda=30, power=2.0, max_boost=50.0,
+                                uvrange_min_klambda=0.0):
+    """Create a copy of an MS and reweight rows by UV distance."""
+    from casatools import table as tbtool
+
+    if os.path.exists(ms_out):
+        print('MS already exists, skipping copy:', ms_out)
+    else:
+        print('Copying MS ->', ms_out)
+        shutil.copytree(ms_in, ms_out)
+
+    lam_m = 3e8 / freqstr_to_hz(freqstr)
+
+    tb = tbtool()
+    tb.open(ms_out, nomodify=False)
+    try:
+        uvw = tb.getcol('UVW')
+        u_m, v_m = uvw[0, :], uvw[1, :]
+        uv_kl = (np.sqrt(u_m * u_m + v_m * v_m) / lam_m) / 1e3
+
+        boost = (np.maximum(uv_kl, uvrange_min_klambda) / float(uv0_klambda)) ** float(power)
+        boost = np.where(uv_kl >= uvrange_min_klambda, boost, 1.0)
+        boost = np.clip(boost, 1.0, float(max_boost))
+
+        for col, op in [('WEIGHT', 'mul'), ('SIGMA', 'divsqrt')]:
+            if col not in tb.colnames():
+                continue
+            arr = tb.getcol(col)
+            if arr.ndim == 1:
+                if op == 'mul':
+                    arr = arr * boost
+                else:
+                    arr = arr / np.sqrt(boost)
+            elif arr.ndim == 2:
+                if arr.shape[1] == boost.size:
+                    if op == 'mul':
+                        arr = arr * boost[None, :]
+                    else:
+                        arr = arr / np.sqrt(boost[None, :])
+                elif arr.shape[0] == boost.size:
+                    if op == 'mul':
+                        arr = arr * boost[:, None]
+                    else:
+                        arr = arr / np.sqrt(boost[:, None])
+                else:
+                    raise ValueError(f'Unexpected {col} shape {arr.shape} for nrow={boost.size}')
+            else:
+                raise ValueError(f'Unexpected {col} ndim={arr.ndim}')
+            tb.putcol(col, arr)
+            print('Updated', col)
+
+        if 'WEIGHT_SPECTRUM' in tb.colnames():
+            wspec = tb.getcol('WEIGHT_SPECTRUM')
+            if wspec.ndim == 3 and wspec.shape[2] == boost.size:
+                wspec = wspec * boost[None, None, :]
+                tb.putcol('WEIGHT_SPECTRUM', wspec)
+                print('Updated WEIGHT_SPECTRUM')
+    finally:
+        tb.close()
+
+    return ms_out
+
+
+def uv_distance_m_from_ms(msfile):
+    """Return UV distance in meters for each visibility row in an MS."""
+    from casatools import table as tbtool
+
+    tb = tbtool()
+    tb.open(msfile)
+    uvw = tb.getcol('UVW')
+    tb.close()
+    u = uvw[0, :]
+    v = uvw[1, :]
+    return np.sqrt(u * u + v * v)
+
+
+def plot_uv_density_splits(msfile, cfg_label_text, thr_list, figdir, freqstr, bin_m=10.0):
+    """Plot UV-density histograms split by threshold in klambda."""
+    uvd = uv_distance_m_from_ms(msfile)
+    lam = 3e8 / freqstr_to_hz(freqstr)
+    uv_kl = uvd / lam / 1e3
+
+    max_uv = np.nanmax(uvd) if np.isfinite(np.nanmax(uvd)) else 10000.0
+    edges = np.arange(0.0, max_uv + bin_m, bin_m)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    fig, axs = plt.subplots(len(thr_list), 1, figsize=(5, 1.5 * len(thr_list)), sharex=True, sharey=True)
+    if len(thr_list) == 1:
+        axs = [axs]
+
+    for ax, thr in zip(axs, thr_list):
+        mask_short = uv_kl < thr
+        mask_long = uv_kl >= thr
+        h_short, _ = np.histogram(uvd[mask_short], bins=edges)
+        h_long, _ = np.histogram(uvd[mask_long], bins=edges)
+        ax.step(centers, h_short, where='mid', label=f'short (<{thr} klambda)', lw=1.5)
+        ax.step(centers, h_long, where='mid', label=f'long (>{thr} klambda)', lw=1.5)
+        ax.set_ylabel('Density\n(counts/10 m)')
+        ax.grid(alpha=0.3)
+        ax.legend(loc='best', fontsize=8)
+        ax.set_yscale('log')
+
+    axs[-1].set_xlabel('UV distance [m]')
+    fig.suptitle(f'UV sampling density split comparison ({cfg_label_text})', y=0.995)
+    fig.tight_layout()
+    out = os.path.join(figdir, f'fig-uv_density_split_compare_{os.path.basename(msfile).replace(".ms", "")}.jpg')
+    fig.savefig(out, dpi=200)
+    print('Saved figure:', out)
+    return out
+
+
+def plot_boost_weighting_curves(msfile, cfg_label_text, boost_grid, figdir, freqstr, max_boost,
+                                uvrange_min_klambda=0.0):
+    """Plot manual weight-boost curves against UV distance."""
+    uvd = uv_distance_m_from_ms(msfile)
+    max_uv = np.nanmax(uvd) if np.isfinite(np.nanmax(uvd)) else 10000.0
+    uvd_grid = np.linspace(0.0, max_uv, 800)
+
+    lam = 3e8 / freqstr_to_hz(freqstr)
+    uv_kl_grid = uvd_grid / lam / 1e3
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+    for uv0, pwr in boost_grid:
+        w = (np.maximum(uv_kl_grid, uvrange_min_klambda) / float(uv0)) ** float(pwr)
+        w = np.clip(w, 1.0, float(max_boost))
+        ax.plot(uvd_grid, w, lw=1.8, label=f'uv0={uv0}k, p={pwr}')
+
+    ax.set_xlabel('UV distance [m]')
+    ax.set_ylabel('Weight factor')
+    ax.set_title(f'Manual boost weighting vs UV distance ({cfg_label_text})')
+    ax.grid(alpha=0.3)
+    ax.legend(loc='best', fontsize=8)
+    fig.tight_layout()
+    out = os.path.join(figdir, f'fig-boost_weighting_curves_{os.path.basename(msfile).replace(".ms", "")}.jpg')
+    fig.savefig(out, dpi=200)
+    print('Saved figure:', out)
+    return out
+
+
+def ensure_default_calibration(msfile, phaerr, amperr, caltbdir='./', calibrated_msfile=None,
+                               overwrite=False, in_place=False):
+    """Generate and apply default phase/amplitude calibration corruption.
+
+    :param msfile: Input measurement set.
+    :type msfile: str
+    :param phaerr: Phase error in radians.
+    :type phaerr: float
+    :param amperr: Fractional amplitude error.
+    :type amperr: float
+    :param caltbdir: Directory holding calibration tables.
+    :type caltbdir: str
+    :param calibrated_msfile: Output calibrated MS path when ``in_place`` is False.
+    :type calibrated_msfile: str or None
+    :param overwrite: If True, rebuild the calibrated MS copy.
+    :type overwrite: bool
+    :param in_place: If True, apply calibration directly to ``msfile``.
+    :type in_place: bool
+    :returns: Path to the calibrated MS.
+    :rtype: str
+    """
+    from casatasks import applycal, clearcal
+
+    phaerr_deg = np.rad2deg(phaerr)
+    gaintable = [
+        f'{caltbdir}/caltb_FASR_corrupt_{phaerr_deg:.0f}deg.ph',
+        f'{caltbdir}/caltb_FASR_corrupt_{np.int_(amperr * 100)}pct.amp',
+    ]
+    if not os.path.exists(gaintable[0]) or not os.path.exists(gaintable[1]):
+        gaintable = generate_caltb(
+            msfile,
+            caltype=['ph', 'amp'],
+            calerr=[phaerr, amperr],
+            caltbdir=caltbdir,
+        )
+    if in_place:
+        calibrated_ms = msfile
+    else:
+        calibrated_ms = calibrated_msfile or msfile.replace('.ms', '_defaultcal.ms')
+        if overwrite and os.path.exists(calibrated_ms):
+            remove_path(calibrated_ms)
+        if not os.path.exists(calibrated_ms):
+            shutil.copytree(msfile, calibrated_ms)
+
+    clearcal(vis=calibrated_ms)
+    applycal(vis=calibrated_ms, gaintable=gaintable, applymode='calonly', calwt=False)
+    return calibrated_ms
+
+
+def calc_noise_terms_for_cfg(config_file, solar_model, freqstr, imsize, cell, tsys, duration,
+                             integration_time, channel_width_mhz, eta_a=0.6):
+    """Return cached-style noise terms matching notebook sensitivity calculations."""
+    antenna_params = np.genfromtxt(config_file, comments='#')
+    dish_diameter = antenna_params[0, 3]
+    uv_cell = 1. / (imsize * float(str(cell).rstrip('arcsec')) / 206265.)
+    total_flux = calc_total_flux_on_dish(solar_model, dish_diameter=dish_diameter, freqghz=freqstr)
+    tant = total_flux_to_tant(total_flux, eta_a=eta_a, dish_diameter=dish_diameter)
+    noisejy, sigma_na, sigma_un = calc_noise(
+        tsys, config_file, dish_diameter=dish_diameter,
+        total_flux=total_flux, duration=duration,
+        integration_time=integration_time,
+        channel_width_mhz=channel_width_mhz,
+        freqghz=freqstr, uv_cell=uv_cell,
+    )
+    sigma_jy = sigma_un / np.sqrt((duration / integration_time))
+    return {
+        'dish_diameter': dish_diameter,
+        'uv_cell': uv_cell,
+        'total_flux': total_flux,
+        'tant': tant,
+        'noisejy': noisejy,
+        'sigma_na': sigma_na,
+        'sigma_un': sigma_un,
+        'sigma_jy': sigma_jy,
+    }
+
+
+def boost_restoringbeam_arcsec(uv0_klambda):
+    """Compute boosted restoring beam in arcsec using 3e4/uv0 scaling."""
+    uv0_lambda = float(uv0_klambda) * 1e3
+    if uv0_lambda <= 0:
+        raise ValueError(f'uv0_klambda must be > 0, got {uv0_klambda}')
+    return (3.0 * 10e3) / uv0_lambda
+
+
+def ensure_split_feather(msfile, msname, uvthr_klambda, cell, deconvolver, scales, imsize, phasecenter,
+                         niter, overwrite_images=False, weighting='superuniform'):
+    """Create short-UV, long-UV, and feathered images for a given MS.
+
+    :param msfile: Input measurement set.
+    :type msfile: str
+    :param msname: Base product name for output images.
+    :type msname: str
+    :param uvthr_klambda: UV split threshold in klambda.
+    :type uvthr_klambda: float
+    :param cell: CASA cell size string.
+    :type cell: str
+    :param deconvolver: CASA deconvolver name.
+    :type deconvolver: str
+    :param scales: Multiscale list used by CASA.
+    :type scales: list
+    :param imsize: Image size.
+    :type imsize: int or list
+    :param phasecenter: CASA phasecenter string.
+    :type phasecenter: str
+    :param niter: CLEAN iteration limit.
+    :type niter: int
+    :param overwrite_images: If True, remove existing image products first.
+    :type overwrite_images: bool
+    :param weighting: CASA weighting passed to both split-image ``tclean`` runs.
+    :type weighting: str
+    :returns: Dict with ``short``, ``long``, and ``feather`` image paths.
+    :rtype: dict
+    """
+    from casatasks import feather, tclean
+
+    short_base = f'{msname}_uvlt{uvthr_klambda}k_{cell}_{weighting}_{deconvolver}'
+    long_base = f'{msname}_uvgt{uvthr_klambda}k_{cell}_{weighting}_{deconvolver}'
+    feather_base = f'{msname}_feather_uvthr{uvthr_klambda}k_{weighting}_{deconvolver}'
+
+    if overwrite_images:
+        for imagename in [short_base, long_base, feather_base]:
+            clear_casa_imagename(imagename)
+    else:
+        clear_casa_imagename_if_shape_mismatch(short_base, imsize)
+        clear_casa_imagename_if_shape_mismatch(long_base, imsize)
+        clear_casa_imagename_if_shape_mismatch(feather_base, imsize)
+
+    if not os.path.exists(short_base + '.image'):
+        tclean(
+            vis=msfile, imagename=short_base, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, uvrange=f'<{uvthr_klambda}klambda',
+            niter=niter, interactive=False,
+        )
+
+    if not os.path.exists(long_base + '.image'):
+        tclean(
+            vis=msfile, imagename=long_base, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, uvrange=f'>{uvthr_klambda}klambda',
+            niter=niter, interactive=False,
+        )
+
+    short_path = short_base + '.image'
+    long_path = long_base + '.image'
+    if not os.path.exists(short_path):
+        raise FileNotFoundError(f'Short-UV image was not created: {short_path}')
+    if not os.path.exists(long_path):
+        raise FileNotFoundError(f'Long-UV image was not created: {long_path}')
+
+    feather_path = feather_base + '.image'
+    feather_needs_refresh = False
+    if os.path.exists(feather_path):
+        try:
+            feather_needs_refresh = (
+                os.path.getmtime(short_path) > os.path.getmtime(feather_path)
+                or os.path.getmtime(long_path) > os.path.getmtime(feather_path)
+            )
+        except OSError:
+            feather_needs_refresh = False
+    if feather_needs_refresh:
+        clear_casa_imagename(feather_base)
+    if not os.path.exists(feather_path):
+        feather(imagename=feather_path, lowres=short_path, highres=long_path, sdfactor=2.0)
+    if not os.path.exists(feather_path):
+        raise RuntimeError(f'Feather output was not created: {feather_path}. Inputs were lowres={short_path}, highres={long_path}')
+
+    return {'short': short_path, 'long': long_path, 'feather': feather_path}
+
+
+def ensure_boost_image(msfile, msname, freqstr, uv0_klambda, power, max_boost, cell, deconvolver, scales,
+                       imsize, phasecenter, niter, overwrite_ms=False, overwrite_image=False,
+                       uvrange_min_klambda=0.0, use_boost_restoringbeam=True, weighting='superuniform'):
+    """Create a boosted-weight MS/image product for a given configuration.
+
+    :param msfile: Input measurement set.
+    :type msfile: str
+    :param msname: Base product name for output images.
+    :type msname: str
+    :param freqstr: Frequency string used for UV reweighting.
+    :type freqstr: str
+    :param uv0_klambda: Characteristic UV scale in klambda.
+    :type uv0_klambda: float
+    :param power: Power-law index for baseline boosting.
+    :type power: float
+    :param max_boost: Maximum applied baseline boost.
+    :type max_boost: float
+    :param cell: CASA cell size string.
+    :type cell: str
+    :param deconvolver: CASA deconvolver name.
+    :type deconvolver: str
+    :param scales: Multiscale list used by CASA.
+    :type scales: list
+    :param imsize: Image size.
+    :type imsize: int or list
+    :param phasecenter: CASA phasecenter string.
+    :type phasecenter: str
+    :param niter: CLEAN iteration limit.
+    :type niter: int
+    :param overwrite_ms: If True, rebuild the boosted MS.
+    :type overwrite_ms: bool
+    :param overwrite_image: If True, rebuild the boosted image.
+    :type overwrite_image: bool
+    :param uvrange_min_klambda: Minimum UV range included in boost weighting.
+    :type uvrange_min_klambda: float
+    :param use_boost_restoringbeam: If True, set a custom restoring beam.
+    :type use_boost_restoringbeam: bool
+    :param weighting: CASA weighting passed to the boosted-image ``tclean`` run.
+    :type weighting: str
+    :returns: Boosted CASA image path.
+    :rtype: str
+    """
+    from casatasks import tclean
+
+    ms_boost = msfile.replace('.ms', f'_wboost_uv0{uv0_klambda}k_p{power}.ms')
+    if overwrite_ms and os.path.exists(ms_boost):
+        remove_path(ms_boost)
+
+    if not os.path.exists(ms_boost):
+        boost_long_baseline_weights(
+            ms_in=msfile, ms_out=ms_boost, freqstr=freqstr,
+            uv0_klambda=uv0_klambda, power=power, max_boost=max_boost,
+            uvrange_min_klambda=uvrange_min_klambda,
+        )
+
+    boost_base = ms_boost.replace('.ms', '') + f'_image_{weighting}_{deconvolver}'
+    if overwrite_image:
+        clear_casa_imagename(boost_base)
+    else:
+        clear_casa_imagename_if_shape_mismatch(boost_base, imsize)
+
+    if not os.path.exists(boost_base + '.image'):
+        tclean_kwargs = dict(
+            vis=ms_boost, imagename=boost_base, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, niter=niter, interactive=False,
+        )
+        if use_boost_restoringbeam:
+            rb_arcsec = boost_restoringbeam_arcsec(uv0_klambda)
+            tclean_kwargs['restoringbeam'] = f'{rb_arcsec:.3f}arcsec'
+        tclean(**tclean_kwargs)
+
+    return boost_base + '.image'
+
+
+def ensure_weighting_reference(msfile, msname, weighting, deconvolver, scales, imsize, cell, phasecenter,
+                               niter, overwrite_image=False):
+    """Ensure a reference image exists for a given CASA weighting mode."""
+    from casatasks import tclean
+
+    imbase = f'{msname}_{weighting}_{deconvolver}'
+    if overwrite_image:
+        clear_casa_imagename(imbase)
+    else:
+        clear_casa_imagename_if_shape_mismatch(imbase, imsize)
+
+    if not os.path.exists(imbase + '.image'):
+        tclean(
+            vis=msfile, imagename=imbase, datacolumn='data', specmode='mfs',
+            deconvolver=deconvolver, scales=casa_safe_scales(scales),
+            imsize=imsize, cell=cell, phasecenter=phasecenter,
+            weighting=weighting, niter=niter, interactive=False,
+        )
+    return imbase + '.image'
+
+
+def plot_compare_casa_vs_model(image_path, model_path, cfg_label_text, noise_terms, image_meta_common, reftime,
+                               crop_fraction, figsize, cmap, vmax, conv_tag, image_rms_corner_size, suffix,
+                               figdir, overwrite_plot=False, extra_meta=None, show_cal_error_text=False):
+    """Plot a CASA image against a model and save the comparison figure."""
+    meta = {
+        **image_meta_common,
+        'title': [image_meta_common.get('title_left', 'Cleaned image'), 'Model (convolved)'],
+        'array_config': cfg_label_text,
+        'tant': f"{noise_terms['tant']:.0f}K",
+        'sigma_jy': f"{noise_terms['sigma_jy']:.1f}Jy/beam",
+    }
+    meta.pop('title_left', None)
+    if extra_meta:
+        meta.update(extra_meta)
+
+    fig, _ = plot_two_casa_images_with_convolution_sunpy(
+        image_path, model_path, crop_fraction=crop_fraction, reftime=reftime,
+        figsize=figsize, image_meta=meta, cmap=cmap, vmax=vmax, vmin=0.1,
+        conv_tag=conv_tag, overwrite_conv=True, rms_mask_radius=1.2,
+        image_rms_corner_size=image_rms_corner_size, coord_frame='radec',
+        match_fov=True, align_model_time_to_image=True, north_up=False,
+        apply_hpc_p_angle=False, anchor_model_wcs_to_image=True,
+        use_reftime_for_hpc=True, show_cal_error_text=show_cal_error_text,
+    )
+    plt.show()
+
+    figname = os.path.join(
+        figdir,
+        f"fig-{base_tag_from_path(image_path)}_vs_{base_tag_from_path(model_path)}_{suffix}_{crop_fraction_tag(crop_fraction)}.jpg"
+    )
+    if os.path.exists(figname) and overwrite_plot:
+        remove_path(figname)
+    if not os.path.exists(figname):
+        fig.savefig(figname, dpi=200)
+        print('Saved figure:', figname)
+    return fig, figname
+
+
 @runtime_report
 def get_local_noon_utc(cfg_path: str, date: datetime = None) -> Time:
     """
@@ -2239,7 +2848,7 @@ def calc_total_flux_on_dish(solar_model, dish_diameter=1.5, freqghz=None):
 @runtime_report
 def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_mhz=10,
                 integration_time=1., msname='fasr.ms', duration=None, tsys=300.,
-                usehourangle=True, ra_deg=None, dec_deg=None):
+                usehourangle=True, ra_deg=None, dec_deg=None, uv_cell=None):
     """
     Generate a Measurement Set (MS) using CASA's simulator tool with the solar model read from a FITS file.
 
@@ -2265,6 +2874,10 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
             Right Ascension of the source in degrees (if None, read from FITS header).
       dec_deg: float or None
             Declination of the source in degrees (if None, read from FITS header).
+      uv_cell : float or None
+            UV cell size in wavelengths passed through to ``calc_noise`` so the
+            MS corruption noise uses the same weighting-grid assumption as any
+            precomputed sensitivity estimate in the notebook.
 
     Returns:
       None; the MS is generated and saved under msname.
@@ -2308,7 +2921,8 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
     else:
         freq_GHz = freqghz
 
-    total_flux = calc_total_flux_on_dish(solar_model, dish_diameter=np.min(dish_dia), freqghz=freq_GHz)
+    dish_diameter = float(np.min(dish_dia))
+    total_flux = calc_total_flux_on_dish(solar_model, dish_diameter=dish_diameter, freqghz=freq_GHz)
 
     # Read source RA and DEC from CRVAL1 and CRVAL2 (in degrees) and convert to radians.
     if ra_deg is None:
@@ -2376,7 +2990,7 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
 
     sm.setdata(spwid=chosen_index)
     # Use the solar model FITS image as the sky model for prediction.
-    dishdiam = np.min(dish_dia)
+    dishdiam = dish_diameter
     vprec = vp.setpbairy(telescope='FASR', dishdiam='{0:.1f}m'.format(dishdiam),
                          blockagediam='0.5m', maxrad='{0:.3f}deg'.format(np.degrees(1.22 * 3e8 / (1e9 * dishdiam))),
                          reffreq=freq_GHz, dopb=True)
@@ -2385,7 +2999,7 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
         msname), os.path.basename(solar_model))
     solar_model_im = os.path.join(os.path.dirname(
         msname), os.path.basename(solar_model.replace('.fits', '.im')))
-    os.system(f'cp -r {solar_model} {solar_model_copy}')
+    shutil.copy2(solar_model, solar_model_copy)
     # if not os.path.exists(solar_model_im):
     update_fits_header(solar_model_copy, freq_GHz)
     ia.fromfits(outfile=solar_model_im,
@@ -2406,14 +3020,16 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
 
     sm.openfromms(msname)
     if tsys is None:
+        print("No Tsys provided, skipping noise corruption.")
         pass
         # sm.setnoise(mode='tsys-atm', trx=500)
     else:
-        noisejy, sigma_na, sigma_un = calc_noise(tsys, config_file, dish_diameter=np.min(dish_dia),
+        noisejy, sigma_na, sigma_un = calc_noise(tsys, config_file, dish_diameter=dish_diameter,
                                                  total_flux=total_flux, duration=duration,
                                                  integration_time=integration_time, channel_width_mhz=channel_width_mhz,
-                                                 freqghz=freq_GHz)
+                                                 freqghz=freq_GHz, uv_cell=uv_cell)
         sm.setnoise(mode='simplenoise', simplenoise=f'{noisejy:.2f}Jy')
+        print(f'Corrupting the visibilities with a noise level of {noisejy:.2f} Jy (Tsys={tsys} K)')
         sm.corrupt()
     sm.done()
     print("Simulation complete. Measurement set generated:", msname)
@@ -2572,8 +3188,10 @@ def convolve_model_image_with_template(model_image, template_image, output_model
     return output_model
 
 def fidelity_evaluation(restored_image, model_image, fidelity_image=None,
-                        doconvolve=True, rms_mask_radius=1.2, n_bins=50, sigma_jy=None, vmin=None, vmax=None,
-                        solar_radius_arcsec=960., do_plot=True, figsize=(12, 5), fontsize=8, xlim=None, ylim=None):
+                        doconvolve=True, rms_mask_radius=1.2, n_bins=50, sigma_jy=None,
+                        solar_radius_arcsec=960., do_plot=True, figsize=(12, 5), fontsize=8,
+                        xlim=None, ylim=None, 
+                        image_arcsec_shift=(0.0, 0.0), image_pixel_shift=(0.0, 0.0)):
     """
     Performs the convolution and calculates the Fidelity Map.
 
@@ -2582,6 +3200,10 @@ def fidelity_evaluation(restored_image, model_image, fidelity_image=None,
         model_image (str): Path to the model image
         doconvolve (bool): Whether to convolve the model image to match the restored image's beam;
                 if False, assumes the model image is already convolved.
+        image_arcsec_shift (tuple): Manual sky shift ``(dx, dy)`` in arcsec
+                applied to the restored image on the regridded comparison grid.
+        image_pixel_shift (tuple): Manual pixel shift ``(dx, dy)`` applied to
+                the restored image on the comparison grid.
 
     Returns:
         fidelity_map (ndarray): The spatial fidelity values (model / (restored - model))
@@ -2629,6 +3251,18 @@ def fidelity_evaluation(restored_image, model_image, fidelity_image=None,
     beam = ia.restoringbeam()
     jybm2k = 1.222e6 / (freqhz / 1e9) ** 2 / (beam['major']['value'] * beam['minor']['value'])
     ia.close()
+
+    dx_pix = float(image_pixel_shift[0]) + float(image_arcsec_shift[0]) / abs(pixscale_x)
+    dy_pix = float(image_pixel_shift[1]) + float(image_arcsec_shift[1]) / abs(pixscale_y)
+    if not (np.isclose(dx_pix, 0.0) and np.isclose(dy_pix, 0.0)):
+        restored_data[:, :, 0, 0] = ndimage_shift(
+            restored_data[:, :, 0, 0],
+            shift=(dy_pix, dx_pix),
+            order=1,
+            mode='constant',
+            cval=0.0,
+            prefilter=False,
+        )
     peak = np.nanmax(restored_data)
 
     ia.open(regridded_model_path)
@@ -2875,6 +3509,7 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
                                           conv_tag='',
                                           overwrite_conv=True, vmax=None, vmin=None,
                                           vmax2=None, vmin2=None, fontsize=8, legend_size=6,
+                                          log_scale=False):
                                           xlim=None, ylim=None):
     """
     Open two CASA images using casatools.image (IA), convolve the second image
@@ -2900,7 +3535,8 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
       contour_levels : array-like or None, optional
           Contour levels to overlay on the second panel.
           If None, levels are set to default percentiles of the first image.
-
+      log_scale : bool, optional
+          If True, render images with logarithmic color scaling.
     Returns:
       fig, axs : tuple
           Matplotlib figure and axes objects.
@@ -2909,6 +3545,8 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     from astropy.time import Time
     if reftime is None:
         reftime = Time.now()
+    elif not isinstance(reftime, Time):
+        reftime = Time(reftime)
     solar_radius_asec = coordinates.sun.angular_radius(reftime).value
 
     plt.rcParams.update({'font.size': fontsize})
@@ -2916,13 +3554,68 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     title1 = titiles[0]
     title2 = titiles[1]
     freqstr = image_meta.get('freq', '')
+    freqstr_plot = freqstr[1:] if isinstance(freqstr, str) and freqstr.startswith('0') else freqstr
     array_config = image_meta.get('array_config', '')
+    array_config_text = image_meta.get('array_config_text', None)
+    array_config_text_explicit = array_config_text is not None
+    if array_config_text is None:
+        array_config_text = array_config
+
+    def _compact_array_cfg_label(cfg_text):
+        if not isinstance(cfg_text, str) or not cfg_text:
+            return cfg_text
+        base = os.path.basename(cfg_text.rstrip('/'))
+        if base.endswith('.cfg'):
+            base = base[:-4]
+        parts = base.split('_')
+        parts_lower = [p.lower() for p in parts]
+        if 'hybrid' in parts_lower and '120' in parts_lower:
+            remote_count = next((p[6:] for p in parts_lower if p.startswith('remote') and len(p) > 6), None)
+            range_token = next((p for p in parts_lower if p.startswith('r') and p.endswith('km') and '-' in p), None)
+            if remote_count and range_token:
+                range_label = range_token[1:].replace('km', ' km').replace('-', '–')
+                return f'Hybrid 120 + {remote_count} remote ({range_label})'
+            return 'Hybrid 120'
+        return base
+
+    if not array_config_text_explicit:
+        array_config_text = _compact_array_cfg_label(array_config_text)
+    if isinstance(array_config_text, str):
+        array_config_text = os.path.basename(array_config_text.rstrip('/')) if array_config_text else ''
+    weighting_meta = image_meta.get('weighting', None)
+    weighting_explicit = image_meta.get('imaging_weighting', None)
+    uvrange_text = image_meta.get('uvrange', None)
+
+    def _infer_weighting_from_name(image_name):
+        name = os.path.basename(image_name).lower()
+        if 'superuniform' in name:
+            return 'superuniform'
+        if 'uniform' in name:
+            return 'uniform'
+        if 'natural' in name:
+            return 'natural'
+        if 'briggs' in name or 'robust' in name:
+            return 'briggs'
+        return None
+
+    inferred_weighting = _infer_weighting_from_name(image1_filename)
+    if weighting_explicit is not None:
+        weighting = weighting_explicit
+    elif isinstance(weighting_meta, str) and ('<' in weighting_meta or '>' in weighting_meta):
+        # Preserve old notebooks where weighting carried a UV-range cut.
+        weighting = inferred_weighting if inferred_weighting is not None else weighting_meta
+        if uvrange_text is None:
+            uvrange_text = weighting_meta
+    else:
+        weighting = weighting_meta if weighting_meta is not None else inferred_weighting
     tsys = image_meta.get('tsys', None)
     tant = image_meta.get('tant', None)
     sigma_jy = image_meta.get('sigma_jy', None)
     cal_error = image_meta.get('cal_error', None)
     dur = image_meta.get('duration', None)
     bandwidth = image_meta.get('bandwidth', None)
+    if not compare_two:
+        figsize = (figsize[0] / 3 * 2, figsize[1])
     weighting = image_meta.get('weighting', None)
     # --- Read image1 (restored image) ---
     img1 = read_casa_image_data(image1_filename)
@@ -2952,32 +3645,103 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
         output_model=output_filename,
         overwrite=overwrite_conv)
 
-    # --- Read convolved image2 ---
-    img2 = read_casa_image_data(output_filename)
-    pixscale_x2 = img2['pixscale_x']
-    pixscale_y2 = img2['pixscale_y']
-    extent2 = img2['extent']
+    # --- Read the convolved image to extract its pixel data ---
+    ia.open(output_filename)
+    pix2 = ia.getchunk()[:, :, 0, 0]
+    csys2 = ia.coordsys()
+    s = ia.summary()
+    bunit = ia.summary()['unit']
+    ia.close()
 
-    # Convert image2 to brightness temperature (use image1's beam for Jy/beam→K)
-    pix2, _ = convert_flux_to_tb(
-        img2['pix'], img2['bunit'], freqhz, beam, pixscale_x2, pixscale_y2)
+    w2 = WCS(naxis=2)
+    w2.wcs.crpix = csys2.referencepixel()['numeric'][0:2]
+    w2.wcs.cdelt = np.array(csys2.increment()['numeric'][0:2]) * rad_to_deg
+    w2.wcs.crval = np.array(csys2.referencevalue()['numeric'][0:2]) * rad_to_deg
+    w2.wcs.ctype = ['RA---SIN', 'DEC--SIN']
+    pixscale_x2 = abs(w2.wcs.cdelt[0]) * 3600.0
+    pixscale_y2 = abs(w2.wcs.cdelt[1]) * 3600.0
+    nx2 = pix2.shape[0]
+    ny2 = pix2.shape[1]
+    extent2 = (-nx2 / 2 * pixscale_x2, nx2 / 2 * pixscale_x2,
+                  -ny2 / 2 * pixscale_y2, ny2 / 2 * pixscale_y2)
 
-    # --- RMS and SNR (masking out the solar disk) ---
+    if bunit.lower() == 'jy/beam':
+        jybm2k = 1.222e6 / (freqhz / 1e9) ** 2 / (beam['major']['value'] * beam['minor']['value'])
+        pix2 *= jybm2k
+    elif bunit.lower() == 'jy/pixel':
+        jypx2k = 1.222e6 / (freqhz / 1e9) ** 2 / ((pixscale_x2 * pixscale_y2) / (np.pi / (4 * np.log(2))))
+        pix2 *= jypx2k
+    elif bunit.lower() == 'k':
+        pass
+
+    # --- Crop both images using the same crop_fraction ---
+    shape1 = pix1.shape[0]  # assume square images.
+    shape2 = pix2.shape[0]
+
     print(f'Applying a mask of {rms_mask_radius:.1f} solar radii to calculate rms outside of it.')
-    rms1, datamax1, _, snr1, _ = calc_image_rms_snr(
-        pix1, rms_mask_radius, pixscale_x, solar_radius_asec)
+
+    def _estimate_rms_outside_disk_or_border(pix, pixscale_arcsec, solar_radius_arcsec, mask_radius):
+        ics_loc = int(pix.shape[0] / 2)
+        radius_pix_loc = int(float(solar_radius_arcsec) * float(mask_radius) / float(pixscale_arcsec))
+        yy, xx = np.ogrid[-ics_loc:pix.shape[0] - ics_loc, -ics_loc:pix.shape[0] - ics_loc]
+        disk_mask = (xx * xx + yy * yy) <= (radius_pix_loc * radius_pix_loc)
+        outside = np.where(~disk_mask, pix, np.nan)
+        rms_loc = np.sqrt(np.nanmean(outside ** 2))
+        if np.isfinite(rms_loc):
+            return rms_loc
+        border = max(2, int(0.1 * pix.shape[0]))
+        border_vals = np.concatenate([
+            pix[:border, :].ravel(),
+            pix[-border:, :].ravel(),
+            pix[:, :border].ravel(),
+            pix[:, -border:].ravel(),
+        ])
+        border_vals = border_vals[np.isfinite(border_vals)]
+        if border_vals.size == 0:
+            return np.nan
+        print('Warning: off-disk mask has no valid pixels in this FOV; using border RMS fallback.')
+        return np.sqrt(np.nanmean(border_vals ** 2))
+
+    datamax1 = np.nanmax(pix1)
+    rms1 = _estimate_rms_outside_disk_or_border(
+        pix1, pixscale_x, solar_radius_asec, rms_mask_radius
+    )
     print(f'Peak of {os.path.basename(image1_filename)}: {datamax1:.3e} K')
     print(f'rms of {os.path.basename(image1_filename)} (excluding solar disk): {rms1:.3e} K')
+    snr1 = datamax1 / rms1 if np.isfinite(rms1) and rms1 > 0 else np.nan
     print(f'SNR of the image: {snr1:.1f}')
 
-    rms2, datamax2, datamin2, snr2, _ = calc_image_rms_snr(
-        pix2, rms_mask_radius, pixscale_x2, solar_radius_asec)
+    rms2 = _estimate_rms_outside_disk_or_border(
+        pix2, pixscale_x2, solar_radius_asec, rms_mask_radius
+    )
+    datamax2 = np.nanmax(pix2)
+    datamin2 = np.nanmin(pix2)
+    snr2 = datamax2 / rms2 if np.isfinite(rms2) and rms2 > 0 else np.nan
     print(f'Peak of {os.path.basename(image2_filename)}: {datamax2:.3e} K')
     print(f'rms of {os.path.basename(image2_filename)} (excluding solar disk): {rms2:.3e} K')
 
-    # --- Crop both images ---
-    cropped1 = crop_image(pix1, crop_fraction)
-    cropped2 = crop_image(pix2, crop_fraction)
+    if isinstance(crop_fraction[0], float):
+        pbl1 = int(shape1 * crop_fraction[0])
+        ptr1 = int(shape1 * crop_fraction[1])
+        pbl2 = int(shape2 * crop_fraction[0])
+        ptr2 = int(shape2 * crop_fraction[1])
+        cropped1 = pix1[pbl1:ptr1, pbl1:ptr1]
+        cropped2 = pix2[pbl2:ptr2, pbl2:ptr2]
+    elif isinstance(crop_fraction[0], tuple) or isinstance(crop_fraction[0], list):
+        px1 = int(shape1 * crop_fraction[0][0])
+        px2 = int(shape1 * crop_fraction[0][1])
+        py1 = int(shape1 * crop_fraction[1][0])
+        py2 = int(shape1 * crop_fraction[1][1])
+        cropped1 = pix1[px1:px2, py1:py2]
+        px1 = int(shape2 * crop_fraction[0][0])
+        px2 = int(shape2 * crop_fraction[0][1])
+        py1 = int(shape2 * crop_fraction[1][0])
+        py2 = int(shape2 * crop_fraction[1][1])
+        cropped2 = pix2[px1:px2, py1:py2]
+    else:
+        cropped1 = pix1
+        cropped2 = pix2
+
     datamin1 = np.nanmin(cropped1)
 
     # Radius (in arcsec) of the mask used to compute the RMS.
@@ -2998,18 +3762,42 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
         vmax2 = vmax
     if vmin2 is None:
         vmin2 = vmin
-    vmax_val2 = np.nanmax(cropped1) * float(vmax2) / 100
-    vmin_val2 = np.nanmax(cropped1) * float(vmin2) / 100
+
+    def _build_color_norm(data, vmin_pct, vmax_pct, use_log):
+        from matplotlib.colors import Normalize
+        peak = np.nanmax(data)
+        vmin_local = peak * float(vmin_pct) / 100
+        vmax_local = peak * float(vmax_pct) / 100
+        if use_log:
+            from matplotlib.colors import LogNorm
+            positive = data[np.isfinite(data) & (data > 0)]
+            if positive.size > 0:
+                vmin_local = max(vmin_local, np.nanmin(positive))
+                vmax_local = max(vmax_local, vmin_local * (1.0 + 1e-6))
+                return LogNorm(vmin=vmin_local, vmax=vmax_local), vmin_local, vmax_local
+            print('log_scale=True but image has no positive pixels; using linear scale instead.')
+        if vmax_local <= vmin_local:
+            vmax_local = vmin_local + np.finfo(float).eps
+        return Normalize(vmin=vmin_local, vmax=vmax_local), vmin_local, vmax_local
+
+    norm1, vmin_val, vmax_val = _build_color_norm(cropped1, vmin, vmax, log_scale)
+    norm2, vmin_val2, vmax_val2 = _build_color_norm(cropped2, vmin2, vmax2, log_scale)
+    plot_cmap = plt.get_cmap(cmap)
+    if log_scale:
+        plot_cmap = plot_cmap.copy()
+        plot_cmap.set_under(plot_cmap(0.0))
+        plot_cmap.set_bad(plot_cmap(0.0))
+    print(f'Plotting image with vmin={vmin_val:.3e} K, vmax={vmax_val:.3e} K')
     print(f'Plotting convolved image with vmin={vmin_val2:.3e} K, vmax={vmax_val2:.3e} K')
     # Left panel: Image1 (original)
     ax1 = axs[0]
-    im1 = ax1.imshow(cropped1.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
-                     vmax=vmax_val, vmin=vmin_val, extent=extent)
+    im1 = ax1.imshow(cropped1.transpose(), origin='lower', cmap=plot_cmap,
+                     norm=norm1, extent=extent1_plot)
 
     # Beam ellipse.
-    ell = Ellipse((ax1.get_xlim()[0] * 0.95, ax1.get_ylim()[0] * 0.95),
-                  width=major_pix * pixscale_x, height=minor_pix * pixscale_x,
-                  angle=(-(90 - pa_deg)),
+    ell = Ellipse((ax1.get_xlim()[0]*0.95, ax1.get_ylim()[0]*0.95),
+                  width=major_pix*pixscale_x, height=minor_pix*pixscale_x,
+                  angle=(-(90-pa_deg)),
                   edgecolor='white', facecolor='none', lw=1.5)
     ax1.add_patch(ell)
 
@@ -3018,6 +3806,8 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
                          edgecolor='white', facecolor='none',
                          linestyle=':', linewidth=1.0)
     ax1.add_patch(rms_circle1)
+
+    
     ax1.set_xlabel('Solar X (arcsec)')
     ax1.set_ylabel('Solar Y (arcsec)')
     if xlim is not None:
@@ -3036,13 +3826,16 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     ax1.text(0.98, 0.13, f'SNR: {snr1:.1f}', transform=ax1.transAxes, ha='right',
              va='bottom', color='white', fontsize=legend_size)
     ax1.text(0.98, 0.16,
-             r"B$_{maj}$, B$_{min}$" + f": {beam['major']['value']:.1f}" + '"' + f", {beam['minor']['value']:.1f}" + '"',
+             r"B$_{maj}$, B$_{min}$" + f": {bmaj_arcsec:.1f}\"" + f", {bmin_arcsec:.1f}\"",
              transform=ax1.transAxes, ha='right', va='bottom', color='white', fontsize=legend_size)
     ax1.text(0.98, 0.22, f'Weighting: {weighting}',
              transform=ax1.transAxes, ha='right', va='bottom', color='white', fontsize=legend_size)
-    ax1.text(0.98, 0.98, freqstr, transform=ax1.transAxes, ha='right',
+    if uvrange_text is not None:
+        ax1.text(0.98, 0.19, f'UV range: {uvrange_text}',
+                 transform=ax1.transAxes, ha='right', va='bottom', color='white', fontsize=legend_size)
+    ax1.text(0.98, 0.98, freqstr_plot, transform=ax1.transAxes, ha='right',
              va='top', color='white', fontsize=legend_size)
-    ax1.text(0.02, 0.98, f'Array cfg: {array_config}', transform=ax1.transAxes, ha='left',
+    ax1.text(0.02, 0.98, f'Array cfg: {array_config_text}', transform=ax1.transAxes, ha='left',
              va='top', color='white', fontsize=legend_size)
     ax1.text(0.02, 0.95, f'Dur: {dur}, Band: {bandwidth}', transform=ax1.transAxes, ha='left',
              va='top', color='white', fontsize=legend_size)
@@ -3057,8 +3850,8 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
 
     # Right panel: Convolved Image2 as background.
     ax2 = axs[-1]
-    im2 = ax2.imshow(cropped2.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
-                     vmax=vmax_val2, vmin=vmin_val2, extent=extent2)
+    im2 = ax2.imshow(cropped2.transpose(), origin='lower', cmap=plot_cmap,
+                     norm=norm2, extent=extent2_plot)
     major_pix2 = beam['major']['value'] / pixscale_x2
     minor_pix2 = beam['minor']['value'] / pixscale_y2
 
@@ -3068,9 +3861,9 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     ax2.set_ylim(ax1.get_ylim())
     ax2.set_title(title2)
 
-    ell = Ellipse((ax2.get_xlim()[0] * 0.95, ax2.get_ylim()[0] * 0.95),
-                  width=major_pix2 * pixscale_x2, height=minor_pix2 * pixscale_x2,
-                  angle=(-(90 - pa_deg)),
+    ell = Ellipse((ax2.get_xlim()[0]*0.95, ax2.get_ylim()[0]*0.95),
+                  width=major_pix2*pixscale_x2, height=minor_pix2*pixscale_x2,
+                  angle=(-(90-pa_deg)),
                   edgecolor='white', facecolor='none', lw=1.5)
     ax2.add_patch(ell)
 
@@ -3079,7 +3872,7 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
                          edgecolor='white', facecolor='none',
                          linestyle=':', linewidth=1.0)
     ax2.add_patch(rms_circle2)
-    ax2.text(0.98, 0.01, r'T$_{B}^{min}$' + f': {datamin2:.1e} K', transform=ax2.transAxes, ha='right',
+    ax2.text(0.98, 0.01, r'T$_{B}^{min}$'+f': {datamin2:.1e} K', transform=ax2.transAxes, ha='right',
              va='bottom', color='white', fontsize=legend_size)
     ax2.text(0.98, 0.04, r'T$_{B}^{rms}$' + f': {rms2:.1e} K', transform=ax2.transAxes, ha='right',
              va='bottom', color='white', fontsize=legend_size)
@@ -3087,7 +3880,7 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
              va='bottom', color='white', fontsize=legend_size)
     ax2.text(0.98, 0.10, f'SNR: {snr2:.1f}', transform=ax2.transAxes, ha='right',
              va='bottom', color='white', fontsize=legend_size)
-    ax2.text(0.98, 0.98, freqstr, transform=ax2.transAxes, ha='right',
+    ax2.text(0.98, 0.98, freqstr_plot, transform=ax2.transAxes, ha='right',
              va='top', color='white', fontsize=legend_size)
     if xlim is not None:
         ax2.set_xlim(xlim)
@@ -3107,23 +3900,1688 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     # Overlay contours from image1 onto the right panel.
     if overlay_contours:
         ax_comp = axs[1]
-        im2 = ax_comp.imshow(cropped2.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
-                             vmax=vmax_val2, vmin=vmin_val2)
-        ax_comp.set_xlabel('Solar X (arcsec)')
-        ax_comp.set_ylabel('Solar Y (arcsec)')
-
-        plt.colorbar(im2, ax=ax_comp)
         if contour_levels is None:
             contour_levels = np.linspace(0.1, 0.9, 5) * np.nanmax(cropped1)
         else:
             contour_levels = np.array(contour_levels) * np.nanmax(cropped1)
-        cs = axs[1].contour(cropped1.transpose(), levels=contour_levels, colors='tab:cyan', origin='lower',
-                            linewidths=0.5)
-        ax_comp.set_title(f'Contour: Left Panel, Background: Right Panel')
+        ax_comp.contour(cropped1.transpose(), levels=contour_levels, colors='tab:cyan', origin='lower',
+                        linewidths=0.5, extent=extent1_plot)
+        ax_comp.set_xlim(ax1.get_xlim())
+        ax_comp.set_ylim(ax1.get_ylim())
+        ax_comp.set_title('Contour: Left Panel, Background: Right Panel')
 
     plt.tight_layout()
     return fig, axs
 
+@runtime_report
+def plot_two_casa_images_with_convolution_sunpy(image1_filename, image2_filename,
+                                                 crop_fraction=(0.0, 1.0), reftime=None,
+                                                 figsize=(9, 4),
+                                                 image_meta={'freq': '', 'title': ['', ''], 'array_config': ''},
+                                                 panel_titles=None,
+                                                 cmap='hinodexrt',
+                                                 conv_tag='',
+                                                 overwrite_conv=True,
+                                                 convolve_model=True,
+                                                 overwrite_fits=True,
+                                                 coord_frame='hpc',
+                                                 match_fov=True,
+                                                 align_model_time_to_image=True,
+                                                 north_up=False,
+                                                 apply_hpc_p_angle=False,
+                                                 anchor_model_wcs_to_image=False,
+                                                 use_reftime_for_hpc=True,
+                                                 hpc_reference_xy=None,
+                                                 force_hpc_origin_at_image_center=False,
+                                                 hpc_xy_shift=(0.0, 0.0),
+                                                 image_arcsec_shift=(0.0, 0.0),
+                                                 image_pixel_shift=(0.0, 0.0),
+                                                 rms_mask_radius=1.2,
+                                                 image_rms_corner_size=20,
+                                                 legend_size=9,
+                                                 log_scale=True,
+                                                 vmin=None,
+                                                 vmax=None,
+                                                 norm_vmin_abs=None,
+                                                 norm_vmax_abs=None,
+                                                 show_cal_error_text=False,
+                                                 show_slit_profiles=False,
+                                                 slit_locations=None,
+                                                 slit_x_fracs=(0.23, 0.49, 0.75),
+                                                 slit_y_fracs=None,
+                                                 slit_profile_axis='y',
+                                                 slit_half_width_px=1,
+                                                 slit_profile_lw=0.8,
+                                                 overlay_image_contours=False,
+                                                 image_contour_levels=(30, 50, 70, 90),
+                                                 image_contour_kwargs=None,
+                                                 return_prepared=False):
+    """Plot two CASA images with SunPy maps after convolving image2 to image1 beam.
+
+    This is a SunPy-map alternative to ``plot_two_casa_images_with_convolution``.
+    It exports CASA images to FITS, optionally converts RA/Dec FITS to HPC FITS,
+    and then plots with ``sunpy.map.Map`` on WCS axes.
+
+    :param image1_filename: Path to the reference CASA image, or a list/tuple
+        of CASA images for multi-image comparison mode.
+    :type image1_filename: str or list[str] or tuple[str]
+    :param image2_filename: Path to the model CASA image.
+    :type image2_filename: str
+    :param crop_fraction: Fractional crop definition. Either ``(f0, f1)`` for a
+        square crop, or ``((x0, x1), (y0, y1))`` for independent axes.
+    :type crop_fraction: tuple
+    :param reftime: Observation reference time for HPC conversion.
+    :type reftime: astropy.time.Time or str or None
+    :param figsize: Figure size in inches.
+    :type figsize: tuple
+    :param image_meta: Plot metadata dict, including panel titles.
+    :type image_meta: dict
+    :param panel_titles: Optional list of titles for image panels in multi-image
+        mode. If None, basenames are used.
+    :type panel_titles: list[str] or None
+    :param cmap: Matplotlib colormap name.
+    :type cmap: str
+    :param conv_tag: Tag appended to the convolved CASA image name.
+    :type conv_tag: str
+    :param overwrite_conv: If True, recompute convolved image2.
+    :type overwrite_conv: bool
+    :param convolve_model: If True, convolve ``image2`` to the restoring beam
+        of ``image1`` before plotting. If False, plot ``image2`` directly.
+    :type convolve_model: bool
+    :param overwrite_fits: If True, overwrite exported FITS intermediates.
+    :type overwrite_fits: bool
+    :param coord_frame: Output plotting frame, either ``'radec'`` or ``'hpc'``.
+    :type coord_frame: str
+    :param match_fov: If True, apply image1 crop world bounds to image2 map.
+    :type match_fov: bool
+    :param align_model_time_to_image: If True, force model-map time metadata to
+        match image1 map time before plotting. Useful when model FITS has stale
+        DATE-OBS values.
+    :type align_model_time_to_image: bool
+    :param north_up: If True, rotate map data to solar north up before submap/plot.
+        Default is False to preserve original pixel data orientation.
+    :type north_up: bool
+    :param apply_hpc_p_angle: If True, apply ``-sun.P(obstime)`` in the HPC
+        header construction. Keep False when simulation images are already
+        north-up.
+    :type apply_hpc_p_angle: bool
+    :param anchor_model_wcs_to_image: If True, replace model-map WCS metadata
+        with image-map WCS metadata after conversion. This is useful for
+        synthetic model products whose absolute RA/Dec header may be offset.
+    :type anchor_model_wcs_to_image: bool
+    :param use_reftime_for_hpc: If True, force RA/Dec->HPC conversion obstime to
+        use ``reftime`` for both maps instead of FITS DATE-OBS.
+    :type use_reftime_for_hpc: bool
+    :param hpc_reference_xy: Optional fixed HPC reference center ``(x, y)`` in
+        arcsec. When set, this overrides the RA/Dec-derived reference coordinate
+        during HPC header construction.
+    :type hpc_reference_xy: tuple or None
+    :param force_hpc_origin_at_image_center: If True, set the HPC reference pixel
+        to image center and assign ``hpc_reference_xy`` (default ``(0,0)``) there.
+        This guarantees the plotted map center is the requested HPC origin.
+    :type force_hpc_origin_at_image_center: bool
+    :param hpc_xy_shift: Common post-conversion shift ``(dx, dy)`` in arcsec
+        applied to both HPC maps before FOV matching/cropping.
+    :type hpc_xy_shift: tuple
+    :param image_arcsec_shift: Manual sky shift ``(dx, dy)`` in arcsec applied
+        to the image panel on the prepared comparison grid.
+    :type image_arcsec_shift: tuple
+    :param image_pixel_shift: Manual pixel shift ``(dx, dy)`` applied to the
+        image panel on the prepared comparison grid. Positive values move the
+        image toward larger pixel indices in x/y.
+    :type image_pixel_shift: tuple
+    :param show_cal_error_text: If True, include the calibration-error text
+        line in the left-panel annotation block. Default is False.
+    :type show_cal_error_text: bool
+    :param show_slit_profiles: If True, add slit-profile panels for the image
+        and convolved-model comparison. If ``slit_locations`` is provided, slit
+        panels are shown regardless of this toggle.
+    :type show_slit_profiles: bool
+    :param slit_locations: Optional fractional x positions for the slit cuts.
+        When provided, these positions are used directly and the slit/profile
+        panels are enabled.
+    :type slit_locations: tuple or list or None
+    :param slit_x_fracs: Fractional x positions used for the slit cuts when
+        ``slit_locations`` is not provided. Retained for backward compatibility.
+    :type slit_x_fracs: tuple or list
+    :param slit_y_fracs: Fractional y positions used for horizontal slit cuts
+        when ``slit_profile_axis`` includes ``'x'``. Defaults to
+        ``slit_x_fracs`` when omitted.
+    :type slit_y_fracs: tuple or list or None
+    :param slit_profile_axis: Slit-profile direction to show. Use ``'y'`` for
+        vertical cuts, ``'x'`` for horizontal cuts, or ``'both'`` for both.
+    :type slit_profile_axis: str
+    :param slit_half_width_px: Half-width in pixels used to average each slit.
+    :type slit_half_width_px: int
+    :param slit_profile_lw: Line width for the slit-profile curves.
+    :type slit_profile_lw: float
+    :param overlay_image_contours: If True, draw contours from the image panel
+        on top of the model panel to make small spatial shifts easier to see.
+    :type overlay_image_contours: bool
+    :param image_contour_levels: Contour levels expressed as percent of the
+        image peak when all values are <= 100, otherwise treated as absolute K.
+    :type image_contour_levels: tuple or list
+    :param image_contour_kwargs: Optional kwargs forwarded to
+        :meth:`matplotlib.axes.Axes.contour` for the overlaid image contours.
+    :type image_contour_kwargs: dict or None
+    :returns: Figure and axes.
+    :rtype: tuple
+    :raises ValueError: If ``coord_frame`` is not supported.
+    :raises RuntimeError: If HPC conversion requested but conversion fails.
+    """
+    from astropy.time import Time
+    from astropy.coordinates import SkyCoord, EarthLocation
+    from sunpy.coordinates import frames, sun
+
+    if reftime is None:
+        reftime = Time.now()
+    elif not isinstance(reftime, Time):
+        reftime = Time(reftime)
+
+    coord_mode = str(coord_frame).strip().lower()
+    if coord_mode not in ('radec', 'hpc'):
+        raise ValueError("coord_frame must be 'radec' or 'hpc'")
+
+    titles = image_meta.get('title', ['', ''])
+    title1 = titles[0] if len(titles) > 0 else 'Image 1'
+    title2 = titles[1] if len(titles) > 1 else 'Image 2 (convolved)'
+    active_slit_x_fracs = tuple(slit_locations) if slit_locations is not None else tuple(slit_x_fracs)
+    active_slit_y_fracs = tuple(slit_y_fracs) if slit_y_fracs is not None else active_slit_x_fracs
+    show_slit_profiles = bool(show_slit_profiles or slit_locations is not None)
+    slit_profile_axis = str(slit_profile_axis).strip().lower()
+    if slit_profile_axis not in ('x', 'y', 'both'):
+        raise ValueError("slit_profile_axis must be 'x', 'y', or 'both'")
+
+    def _crop_pixel_bounds(nx, ny, crop):
+        if isinstance(crop[0], float):
+            x0 = int(nx * crop[0]); x1 = int(nx * crop[1])
+            y0 = int(ny * crop[0]); y1 = int(ny * crop[1])
+        elif isinstance(crop[0], (tuple, list)):
+            x0 = int(nx * crop[0][0]); x1 = int(nx * crop[0][1])
+            y0 = int(ny * crop[1][0]); y1 = int(ny * crop[1][1])
+        else:
+            x0, x1, y0, y1 = 0, nx, 0, ny
+        x0 = max(0, min(nx - 1, x0)); x1 = max(x0 + 1, min(nx, x1))
+        y0 = max(0, min(ny - 1, y0)); y1 = max(y0 + 1, min(ny, y1))
+        return x0, x1, y0, y1
+
+    def _export_casa_image_to_fits(casa_image, fits_path):
+        if overwrite_fits and os.path.exists(fits_path):
+            os.system('rm -rf ' + fits_path)
+        if overwrite_fits or not os.path.exists(fits_path):
+            ia_local = IA()
+            ia_local.open(casa_image)
+            ia_local.tofits(fits_path, overwrite=True)
+            ia_local.close()
+        return fits_path
+
+    def _fits_path_for_casa_image(casa_image, fits_tag):
+        # Keep names unambiguous and avoid global string replacements like ".im" -> tag.
+        return casa_image + fits_tag
+
+    def _replace_nan_with_zero_in_fits(fits_path):
+        hdul = fits.open(fits_path, mode='update')
+        try:
+            arr = hdul[0].data
+            if arr is not None:
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                hdul[0].data = arr
+                hdul.flush()
+        finally:
+            hdul.close()
+
+    def _set_map_obstime(map_obj, obstime_target):
+        meta = dict(map_obj.meta)
+        isot = Time(obstime_target).isot
+        meta['date-obs'] = isot
+        meta['date_obs'] = isot
+        return sunpy.map.Map(map_obj.data, meta)
+
+    def _shift_hpc_map(map_obj, shift_xy):
+        dx, dy = float(shift_xy[0]), float(shift_xy[1])
+        if np.isclose(dx, 0.0) and np.isclose(dy, 0.0):
+            return map_obj
+        meta = dict(map_obj.meta)
+        # In this workflow, HPC map CRVAL units are arcsec.
+        meta['crval1'] = float(meta.get('crval1', 0.0)) + dx
+        meta['crval2'] = float(meta.get('crval2', 0.0)) + dy
+        return sunpy.map.Map(map_obj.data, meta)
+
+    def _to_plot_map(casa_image, fits_tag, obstime_override=None):
+        fits_path = _fits_path_for_casa_image(casa_image, fits_tag)
+        _export_casa_image_to_fits(casa_image, fits_path)
+        if coord_mode == 'radec':
+            m = sunpy.map.Map(fits_path)
+            if obstime_override is not None:
+                m = _set_map_obstime(m, obstime_override)
+            return m
+
+        # Build an HPC map directly from the RA/Dec FITS header using SunPy/Astropy.
+        # NaN/Inf are zeroed in the HPC branch as requested.
+        try:
+            hdul = fits.open(fits_path)
+            hdr = hdul[0].header
+            arr = hdul[0].data
+            hdul.close()
+
+            if arr is None:
+                raise RuntimeError('FITS data is empty')
+            arr = np.asarray(arr)
+            if arr.ndim >= 4:
+                data2d = arr[0, 0, :, :]
+            elif arr.ndim == 3:
+                data2d = arr[0, :, :]
+            elif arr.ndim == 2:
+                data2d = arr
+            else:
+                raise RuntimeError(f'Unsupported FITS data ndim={arr.ndim}')
+            data2d = np.nan_to_num(data2d, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if obstime_override is not None:
+                obstime = Time(obstime_override)
+            elif use_reftime_for_hpc:
+                obstime = Time(reftime)
+            else:
+                obstime = Time(hdr.get('date-obs', reftime.isot))
+            obs_loc = EarthLocation(lat=37.232259 * u.deg, lon=-118.28479 * u.deg)
+            obs_gcrs = SkyCoord(obs_loc.get_gcrs(obstime))
+
+            cunit1 = u.Unit(hdr.get('cunit1', 'deg'))
+            cunit2 = u.Unit(hdr.get('cunit2', 'deg'))
+            reference_coord = SkyCoord(
+                hdr['crval1'] * cunit1,
+                hdr['crval2'] * cunit2,
+                frame='gcrs',
+                obstime=obstime,
+                obsgeoloc=obs_gcrs.cartesian,
+                obsgeovel=obs_gcrs.velocity.to_cartesian(),
+                distance=obs_gcrs.hcrs.distance,
+            )
+            reference_coord_arcsec = reference_coord.transform_to(frames.Helioprojective(observer=obs_gcrs))
+            if hpc_reference_xy is not None:
+                reference_coord_arcsec = SkyCoord(
+                    hpc_reference_xy[0] * u.arcsec,
+                    hpc_reference_xy[1] * u.arcsec,
+                    frame=frames.Helioprojective(observer=obs_gcrs, obstime=obstime),
+                )
+
+            cdelt1 = (np.abs(hdr['cdelt1']) * u.deg).to(u.arcsec)
+            cdelt2 = (np.abs(hdr['cdelt2']) * u.deg).to(u.arcsec)
+            p_angle = sun.P(obstime)
+            rot_angle = -p_angle if apply_hpc_p_angle else 0.0 * u.deg
+
+            if force_hpc_origin_at_image_center:
+                ny, nx = data2d.shape
+                refpix = [(nx - 1) / 2.0, (ny - 1) / 2.0]
+            else:
+                refpix = [hdr['crpix1'] - 1, hdr['crpix2'] - 1]
+
+            mk_kwargs = dict(
+                reference_pixel=u.Quantity(refpix * u.pixel),
+                scale=u.Quantity([cdelt1, cdelt2] * u.arcsec / u.pix),
+                rotation_angle=rot_angle,
+                observatory='FASR',
+            )
+            if 'crval3' in hdr and np.isfinite(hdr['crval3']):
+                mk_kwargs['wavelength'] = (hdr['crval3'] * u.Hz).to(u.MHz)
+            new_header = sunpy.map.make_fitswcs_header(data2d, reference_coord_arcsec, **mk_kwargs)
+            new_header['date-obs'] = obstime.isot
+            return sunpy.map.Map(data2d, new_header)
+        except Exception as e:
+            raise RuntimeError(f'Failed to build HPC map from RA/Dec FITS: {e}')
+
+    from matplotlib.colors import LogNorm, Normalize
+    from matplotlib.lines import Line2D
+    from matplotlib.axes import Axes
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    # Normalize input so single and multiple images share one entry flow.
+    image_list = [str(p) for p in image1_filename] if isinstance(image1_filename, (list, tuple)) else [str(image1_filename)]
+    if len(image_list) == 0:
+        raise ValueError('image1_filename list is empty')
+    if len(image_list) > 1 and convolve_model:
+        raise ValueError('Multi-image mode only supports convolve_model=False')
+
+    image_titles = list(panel_titles) if panel_titles is not None else None
+    if image_titles is None:
+        if len(image_list) == 1:
+            image_titles = [title1]
+        else:
+            image_titles = [os.path.basename(p) for p in image_list]
+
+    def _single_call_meta(idx):
+        meta_local = dict(image_meta)
+        meta_local_titles = list(meta_local.get('title', [title1, title2]))
+        if len(meta_local_titles) < 2:
+            meta_local_titles = [title1, title2]
+        meta_local_titles[0] = image_titles[idx] if idx < len(image_titles) else f'Image {idx + 1}'
+        meta_local['title'] = meta_local_titles
+        return meta_local
+
+    def _build_shared_norm(prepared_list):
+        common_parts = []
+        for prep_item in prepared_list:
+            common_parts.append(prep_item['data1'][np.isfinite(prep_item['data1'])].ravel())
+        common_parts.append(prepared_list[0]['data2'][np.isfinite(prepared_list[0]['data2'])].ravel())
+        common_data = np.concatenate([c for c in common_parts if c.size > 0]) if len(common_parts) > 0 else np.array([1.0])
+        if common_data.size == 0:
+            common_data = np.array([1.0])
+
+        vmin_pct = (0.1 if vmin is None else vmin)
+        vmax_pct = (90 if vmax is None else vmax)
+        peak_ref = np.nanmax(common_data)
+        if norm_vmin_abs is not None and norm_vmax_abs is not None:
+            shared_vmin = float(norm_vmin_abs)
+            shared_vmax = float(norm_vmax_abs)
+        else:
+            shared_vmin = peak_ref * float(vmin_pct) / 100.0
+            shared_vmax = peak_ref * float(vmax_pct) / 100.0
+        if log_scale:
+            pos = common_data[np.isfinite(common_data) & (common_data > 0)]
+            if pos.size > 0:
+                shared_vmin = max(shared_vmin, np.nanmin(pos))
+                shared_vmax = max(shared_vmax, shared_vmin * (1.0 + 1e-6))
+            else:
+                shared_vmin, shared_vmax = 1e-3, 1.0
+            norm_shared = LogNorm(vmin=shared_vmin, vmax=shared_vmax)
+        else:
+            if shared_vmax <= shared_vmin:
+                shared_vmax = shared_vmin + np.finfo(float).eps
+            norm_shared = Normalize(vmin=shared_vmin, vmax=shared_vmax)
+        return norm_shared
+
+    def _render_prepared(prepared_list):
+        norm_shared = _build_shared_norm(prepared_list)
+        plot_cmap = plt.get_cmap(cmap)
+        profile_axes_to_plot = ()
+        if show_slit_profiles:
+            if slit_profile_axis == 'both':
+                profile_axes_to_plot = ('y', 'x')
+            else:
+                profile_axes_to_plot = (slit_profile_axis,)
+        if log_scale:
+            plot_cmap = plot_cmap.copy()
+            plot_cmap.set_under(plot_cmap(0.0))
+            plot_cmap.set_bad(plot_cmap(0.0))
+
+        ntotal = len(prepared_list) + 1
+        if ntotal == 4 and not show_slit_profiles:
+            nrows, ncols = 2, 2
+        elif ntotal == 2:
+            nrows, ncols = 1, 2
+        else:
+            nrows, ncols = 1, ntotal
+
+        if show_slit_profiles:
+            nrows, ncols = 1, ntotal + len(profile_axes_to_plot)
+        fig = plt.figure(figsize=figsize,
+                         constrained_layout=(ntotal == 2 and not show_slit_profiles))
+        gs = fig.add_gridspec(
+            nrows, ncols, wspace=0.04 if show_slit_profiles else 0.02, hspace=0.04,
+            width_ratios=([2] * ntotal + [1] * len(profile_axes_to_plot)) if show_slit_profiles else None
+        )
+        axs = []
+        map_axes = []
+        txt_kw = dict(color='white', fontsize=legend_size)
+
+        def _add_beam(ax, prep_item):
+            bmaj_arcsec = float(prep_item['beam']['major']['value'])
+            bmin_arcsec = float(prep_item['beam']['minor']['value'])
+            bpa_deg = float(prep_item['beam']['positionangle']['value'])
+            beam_angle = (-(90.0 - bpa_deg))
+            x0, x1 = ax.get_xlim()
+            y0, y1 = ax.get_ylim()
+            bw = max(bmaj_arcsec, 0.01 * abs(x1 - x0))
+            bh = max(bmin_arcsec, 0.01 * abs(y1 - y0))
+            bx = x0 + 0.06 * (x1 - x0) + 0.5 * bw
+            by = y0 + 0.06 * (y1 - y0) + 0.5 * bh
+            ax.add_patch(Ellipse((bx, by), width=bw, height=bh, angle=beam_angle,
+                                 edgecolor='none', facecolor='white', lw=0.0))
+
+        def _annotate_image_panel(ax, prep_item):
+            lt1 = [
+                f'Array cfg: {prep_item["array_config_text"]}',
+                f'Dur: {prep_item["dur"]}, Band: {prep_item["bandwidth"]}',
+                r'T$_{sys}$' + f': {prep_item["tsys"]}, ' + r'T$_{ant}$' + f': {prep_item["tant"]}',
+            ]
+            if show_cal_error_text:
+                lt1.append(f'Cal err: {prep_item["cal_error"]}')
+            for j, txt in enumerate(lt1):
+                ax.text(0.02, 0.98 - j * 0.06, txt, transform=ax.transAxes, ha='left', va='top', **txt_kw)
+
+            rb1 = [
+                r'$\sigma_I$' + f': {prep_item["sigma_jy"]}, ' + r'$\sigma_T$' + f': {prep_item["sigma_tb"]:.1e}K',
+                r'T$_B^{min}$' + f': {prep_item["datamin1"]:.1e} K',
+                r'T$_B^{rms}$' + f': {prep_item["rms1"]:.1e} K',
+                r'T$_B^{max}$' + f': {prep_item["datamax1"]:.1e} K',
+                f'SNR: {prep_item["snr1"]:.1f}',
+                r"B$_{maj}$, B$_{min}$" + f": {float(prep_item['beam']['major']['value']):.1f}\""
+                + f", {float(prep_item['beam']['minor']['value']):.1f}\"",
+            ]
+            if prep_item['uvrange_text'] is not None:
+                rb1.append(f'UV range: {prep_item["uvrange_text"]}')
+            if prep_item['weighting'] is not None:
+                rb1.append(f'Weighting: {prep_item["weighting"]}')
+            for j, txt in enumerate(rb1):
+                ax.text(0.98, 0.02 + j * 0.055, txt, transform=ax.transAxes, ha='right', va='bottom', **txt_kw)
+            ax.text(0.98, 0.98, prep_item['freqstr_plot'], transform=ax.transAxes, ha='right', va='top', **txt_kw)
+
+        def _annotate_model_panel(ax, prep_item):
+            if prep_item.get('right_panel_is_image', False):
+                rb2 = [
+                    r'$\sigma_I$' + f': {prep_item["sigma_jy"]}, ' + r'$\sigma_T$' + f': {prep_item["sigma_tb2"]:.1e}K',
+                    r'T$_B^{min}$' + f': {prep_item["datamin2"]:.1e} K',
+                    r'T$_B^{rms}$' + f': {prep_item["rms2"]:.1e} K',
+                    r'T$_B^{max}$' + f': {prep_item["datamax2"]:.1e} K',
+                    f'SNR: {prep_item["snr2"]:.1f}',
+                    r"B$_{maj}$, B$_{min}$" + f": {float(prep_item['beam2']['major']['value']):.1f}\""
+                    + f", {float(prep_item['beam2']['minor']['value']):.1f}\"",
+                ]
+                if prep_item['weighting'] is not None:
+                    rb2.append(f'Weighting: {prep_item["weighting"]}')
+            else:
+                rb2 = [
+                    r'T$_B^{min}$' + f': {prep_item["datamin2"]:.1e} K',
+                    r'T$_B^{rms}$' + f': {prep_item["rms2"]:.1e} K',
+                    r'T$_B^{max}$' + f': {prep_item["datamax2"]:.1e} K',
+                    f'SNR: {prep_item["snr2"]:.1f}',
+                ]
+            for j, txt in enumerate(rb2):
+                ax.text(0.98, 0.02 + j * 0.055, txt, transform=ax.transAxes, ha='right', va='bottom', **txt_kw)
+            ax.text(0.98, 0.98, prep_item['freqstr_plot'], transform=ax.transAxes, ha='right', va='top', **txt_kw)
+
+        def _add_slit_guides(ax, prep_item):
+            data_model = np.asarray(prep_item['data2'], dtype=float)
+            ny, nx = data_model.shape
+            ncolors = max(len(active_slit_x_fracs), len(active_slit_y_fracs), 1)
+            slit_colors = plt.rcParams['axes.prop_cycle'].by_key()['color'][:ncolors]
+            pix_transform = ax.get_transform('pixel')
+            if slit_profile_axis in ('y', 'both'):
+                for xf, color in zip(active_slit_x_fracs, slit_colors):
+                    xpix = float(xf) * (nx - 1)
+                    ax.plot([xpix, xpix], [0, ny - 1], color=color, lw=1.0, transform=pix_transform, zorder=10)
+            if slit_profile_axis in ('x', 'both'):
+                for yf, color in zip(active_slit_y_fracs, slit_colors):
+                    ypix = float(yf) * (ny - 1)
+                    ax.plot([0, nx - 1], [ypix, ypix], color=color, lw=1.0, transform=pix_transform, zorder=10)
+
+        def _profile_coords(prep_item, axis):
+            data_img = np.asarray(prep_item['data1'], dtype=float)
+            ny, nx = data_img.shape
+            try:
+                pixscale_y_arcsec = abs(prep_item['sub1'].scale.axis2.to_value(u.arcsec / u.pix))
+            except Exception:
+                pixscale_y_arcsec = abs(prep_item['sub1'].scale.axis1.to_value(u.arcsec / u.pix))
+            try:
+                pixscale_x_arcsec = abs(prep_item['sub1'].scale.axis1.to_value(u.arcsec / u.pix))
+            except Exception:
+                pixscale_x_arcsec = pixscale_y_arcsec
+            if axis == 'y':
+                coord_arcsec = (np.arange(ny) - 0.5 * (ny - 1)) * pixscale_y_arcsec
+                return data_img, ny, nx, coord_arcsec
+            coord_arcsec = (np.arange(nx) - 0.5 * (nx - 1)) * pixscale_x_arcsec
+            return data_img, ny, nx, coord_arcsec
+
+        def _resolve_contour_levels(data_img):
+            levels = np.atleast_1d(np.array(image_contour_levels, dtype=float))
+            levels = levels[np.isfinite(levels)]
+            if levels.size == 0:
+                return np.array([])
+            data_pos = data_img[np.isfinite(data_img) & (data_img > 0)]
+            if data_pos.size == 0:
+                return np.array([])
+            peak_img = np.nanmax(data_pos)
+            if np.nanmax(levels) <= 100.0:
+                levels = peak_img * levels / 100.0
+            levels = np.unique(np.sort(levels[(levels > 0) & (levels < peak_img * (1.0 + 1e-9))]))
+            return levels
+
+        def _overlay_image_contours_on_model(ax, prep_item):
+            if not overlay_image_contours:
+                return
+            contour_levels = _resolve_contour_levels(np.asarray(prep_item['data1'], dtype=float))
+            if contour_levels.size == 0:
+                return
+            contour_kwargs = dict(colors='tab:blue', linewidths=0.8, alpha=0.85)
+            if isinstance(image_contour_kwargs, dict):
+                contour_kwargs.update(image_contour_kwargs)
+            ax.contour(
+                np.asarray(prep_item['data1'], dtype=float),
+                levels=contour_levels,
+                transform=ax.get_transform(prep_item['sub1'].wcs),
+                origin='lower',
+                zorder=9,
+                **contour_kwargs,
+            )
+
+        def _plot_slit_profiles(ax, prepared_items, axis='y', show_ylabel=False, title=None):
+            fracs = active_slit_x_fracs if axis == 'y' else active_slit_y_fracs
+            slit_colors = plt.rcParams['axes.prop_cycle'].by_key()['color'][:len(fracs)]
+            image_linestyles = ['-', '--', '-.', (0, (1.2, 1.2))]
+            model_plotted = False
+
+            for img_idx, prep_item in enumerate(prepared_items):
+                data_img, ny, nx, coord_arcsec = _profile_coords(prep_item, axis)
+                data_model = np.asarray(prep_item['data2'], dtype=float)
+                image_ls = image_linestyles[min(img_idx, len(image_linestyles) - 1)]
+                for frac, color in zip(fracs, slit_colors):
+                    if axis == 'y':
+                        xpix = int(round(float(frac) * (nx - 1)))
+                        x0 = max(0, xpix - int(slit_half_width_px))
+                        x1 = min(nx, xpix + int(slit_half_width_px) + 1)
+                        prof_img = np.nanmean(data_img[:, x0:x1], axis=1)
+                        prof_model = np.nanmean(data_model[:, x0:x1], axis=1)
+                    else:
+                        ypix = int(round(float(frac) * (ny - 1)))
+                        y0 = max(0, ypix - int(slit_half_width_px))
+                        y1 = min(ny, ypix + int(slit_half_width_px) + 1)
+                        prof_img = np.nanmean(data_img[y0:y1, :], axis=0)
+                        prof_model = np.nanmean(data_model[y0:y1, :], axis=0)
+                    ax.plot(prof_img, coord_arcsec, color=color, lw=slit_profile_lw, linestyle=image_ls)
+                    if not model_plotted:
+                        ax.plot(prof_model, coord_arcsec, color=color, lw=slit_profile_lw, linestyle=':')
+                model_plotted = True
+
+            ax.set_xscale('log')
+            ax.set_xlabel(r'T$_B$ [K]')
+            if show_ylabel:
+                ax.set_ylabel(f'Relative {axis.upper()} [arcsec]')
+                ax.yaxis.set_label_position('right')
+                ax.yaxis.tick_right()
+            if title is not None:
+                ax.set_title(title)
+            ax.grid(True, alpha=0.3, linestyle=':')
+            xlim_prof = ax.get_xlim()
+            ax.set_xlim(max(1e-4 * xlim_prof[1], np.finfo(float).tiny), xlim_prof[1])
+
+        for i, prep_item in enumerate(prepared_list):
+            r, c = (i // ncols, i % ncols)
+            ax = fig.add_subplot(gs[r, c], projection=prep_item['sub1'])
+            prep_item['sub1'].plot(axes=ax, cmap=plot_cmap, norm=norm_shared)
+            if show_slit_profiles:
+                ax.set_anchor('E')
+            _add_beam(ax, prep_item)
+            ax.set_title(prep_item['title1'])
+            _annotate_image_panel(ax, prep_item)
+            axs.append(ax)
+            map_axes.append(ax)
+
+        prep0 = prepared_list[0]
+        i = len(prepared_list)
+        r, c = (i // ncols, i % ncols)
+        axm = fig.add_subplot(gs[r, c], projection=prep0['sub2'])
+        im_model = prep0['sub2'].plot(axes=axm, cmap=plot_cmap, norm=norm_shared)
+        if show_slit_profiles:
+            axm.set_anchor('W')
+        _add_beam(axm, prep0)
+        _overlay_image_contours_on_model(axm, prep0)
+        if show_slit_profiles:
+            _add_slit_guides(axm, prep0)
+        axm.set_title(prep0['title2'])
+        _annotate_model_panel(axm, prep0)
+        try:
+            axm.coords[1].set_axislabel('')
+        except Exception:
+            pass
+        axs.append(axm)
+        map_axes.append(axm)
+
+        if show_slit_profiles:
+            legend_handles = [
+                Line2D([0], [0], color='black', lw=slit_profile_lw, linestyle='-', label='Image'),
+                Line2D([0], [0], color='black', lw=slit_profile_lw, linestyle=':', label='Model'),
+            ]
+            for idx_profile, axis_name in enumerate(profile_axes_to_plot):
+                axp = fig.add_subplot(gs[0, ntotal + idx_profile])
+                axp.set_anchor('W')
+                _plot_slit_profiles(
+                    axp,
+                    prepared_list,
+                    axis=axis_name,
+                    show_ylabel=True,
+                    title=f'{axis_name.upper()}-slit profiles',
+                )
+                if idx_profile == 0:
+                    axp.legend(handles=legend_handles, fontsize=legend_size, ncol=1, loc='upper right')
+                axs.append(axp)
+
+        if show_slit_profiles:
+            divider = make_axes_locatable(axm)
+            cax = divider.append_axes("right", size="4.0%", pad=0.1, axes_class=Axes)
+            cbar = fig.colorbar(im_model, cax=cax)
+            cbar.ax.set_xlabel('')
+            cbar.ax.xaxis.set_visible(False)
+            cbar.ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False, labeltop=False)
+            cbar.ax.yaxis.set_ticks_position('right')
+            cbar.ax.yaxis.set_label_position('right')
+            cbar.ax.tick_params(axis='y', which='both', labelsize=legend_size - 1)
+        elif ntotal == 2:
+            cbar = fig.colorbar(im_model, ax=axs, label=r'T$_B$ [K]', fraction=0.046, pad=0.04)
+        else:
+            if ntotal == 4:
+                cax = fig.add_axes([0.885, 0.16, 0.024, 0.70])
+            else:
+                cax = fig.add_axes([0.92, 0.14, 0.022, 0.72])
+            sm = plt.cm.ScalarMappable(norm=norm_shared, cmap=plt.get_cmap(cmap))
+            sm.set_array([])
+            cbar = fig.colorbar(sm, cax=cax)
+        cbar.set_label(r'T$_B$ [K]')
+        ticks = cbar.ax.get_yticks()
+        def _fmt_sci_tick(val):
+            s = f'{val:.0e}'
+            mant, exp = s.split('e')
+            return f'{mant}e{int(exp)}'
+        cbar.ax.set_yticklabels([_fmt_sci_tick(t) for t in ticks])
+
+        if show_slit_profiles:
+            fig.subplots_adjust(left=0.05, right=0.98, top=0.93, bottom=0.12, wspace=0.03)
+        elif ntotal == 4:
+            fig.subplots_adjust(left=0.03, right=0.86, top=0.97, bottom=0.04, wspace=0.2, hspace=0.2)
+        elif ntotal != 2:
+            fig.subplots_adjust(left=0.02, right=0.90, top=0.95, bottom=0.05, wspace=0.04)
+        return fig, axs
+
+    if not return_prepared:
+        prepared = []
+        for idx, img_path in enumerate(image_list):
+            prepared.append(
+                plot_two_casa_images_with_convolution_sunpy(
+                    img_path,
+                    image2_filename,
+                    crop_fraction=crop_fraction,
+                    reftime=reftime,
+                    figsize=figsize,
+                    image_meta=_single_call_meta(idx),
+                    panel_titles=None,
+                    cmap=cmap,
+                    conv_tag=conv_tag,
+                    overwrite_conv=overwrite_conv,
+                    convolve_model=convolve_model,
+                    overwrite_fits=overwrite_fits,
+                    coord_frame=coord_frame,
+                    match_fov=match_fov,
+                    align_model_time_to_image=align_model_time_to_image,
+                    north_up=north_up,
+                    apply_hpc_p_angle=apply_hpc_p_angle,
+                    anchor_model_wcs_to_image=anchor_model_wcs_to_image,
+                    use_reftime_for_hpc=use_reftime_for_hpc,
+                    hpc_reference_xy=hpc_reference_xy,
+                    force_hpc_origin_at_image_center=force_hpc_origin_at_image_center,
+                    hpc_xy_shift=hpc_xy_shift,
+                    image_arcsec_shift=image_arcsec_shift,
+                    image_pixel_shift=image_pixel_shift,
+                    rms_mask_radius=rms_mask_radius,
+                    image_rms_corner_size=image_rms_corner_size,
+                    legend_size=legend_size,
+                    log_scale=log_scale,
+                    vmin=vmin,
+                    vmax=vmax,
+                    norm_vmin_abs=norm_vmin_abs,
+                    norm_vmax_abs=norm_vmax_abs,
+                    show_cal_error_text=show_cal_error_text,
+                    show_slit_profiles=show_slit_profiles,
+                    slit_locations=active_slit_x_fracs,
+                    slit_x_fracs=slit_x_fracs,
+                    slit_y_fracs=active_slit_y_fracs,
+                    slit_profile_axis=slit_profile_axis,
+                    slit_half_width_px=slit_half_width_px,
+                    slit_profile_lw=slit_profile_lw,
+                    overlay_image_contours=overlay_image_contours,
+                    image_contour_levels=image_contour_levels,
+                    image_contour_kwargs=image_contour_kwargs,
+                    return_prepared=True,
+                )
+            )
+        return _render_prepared(prepared)
+
+    # Continue with the stable single-image path.
+    image1_filename = image_list[0]
+
+    # Build optional convolved image2 in CASA image format first.
+    ia = IA()
+    ia.open(image1_filename)
+    beam = ia.restoringbeam()
+    s1 = ia.summary()
+    bunit1 = str(s1.get('unit', 'K')).lower()
+    freqhz = s1['refval'][3]
+    ia.close()
+
+    if convolve_model:
+        output_filename = image2_filename.replace('.im', f'{conv_tag}.im.convolved')
+        major = f"{beam['major']['value']}{beam['major']['unit']}"
+        minor = f"{beam['minor']['value']}{beam['minor']['unit']}"
+        pa = f"{beam['positionangle']['value']}{beam['positionangle']['unit']}"
+        if overwrite_conv or not os.path.exists(output_filename):
+            ia.open(image2_filename)
+            ia.convolve2d(outfile=output_filename, axes=[0, 1], type='gauss',
+                          major=major, minor=minor, pa=pa, overwrite=True)
+            ia.close()
+    else:
+        output_filename = image2_filename
+
+    ia.open(output_filename)
+    if convolve_model:
+        beam2 = beam
+    else:
+        try:
+            beam2 = ia.restoringbeam()
+        except Exception:
+            beam2 = beam
+    pix2_full = ia.getchunk()[:, :, 0, 0]
+    csys2 = ia.coordsys()
+    s2 = ia.summary()
+    bunit2 = str(s2.get('unit', 'K')).lower()
+    inc2 = np.array(csys2.increment()['numeric'][0:2])
+    pixscale_x2 = abs(inc2[0]) * (180.0 / np.pi) * 3600.0
+    pixscale_y2 = abs(inc2[1]) * (180.0 / np.pi) * 3600.0
+    ia.close()
+
+    map1_obstime = Time(reftime) if (coord_mode == 'hpc' and use_reftime_for_hpc) else None
+    map1 = _to_plot_map(image1_filename, '.sunpy_map.fits', obstime_override=map1_obstime)
+    model_obstime = Time(map1.meta.get('date-obs', reftime.isot)) if align_model_time_to_image else None
+    map2 = _to_plot_map(output_filename, '.sunpy_map.fits', obstime_override=model_obstime)
+    print(f'Image1 map obstime: {map1.meta.get("date-obs", "N/A")}, Image2 map obstime: {map2.meta.get("date-obs", "N/A")}')
+
+    if coord_mode == 'hpc' and anchor_model_wcs_to_image:
+        # For synthetic simulations, enforce the same HPC WCS grid to avoid
+        # absolute-coordinate offsets carried in model headers.
+        meta2 = dict(map1.meta)
+        if align_model_time_to_image and 'date-obs' in map1.meta:
+            meta2['date-obs'] = map1.meta['date-obs']
+            meta2['date_obs'] = map1.meta['date-obs']
+        map2 = sunpy.map.Map(map2.data, meta2)
+
+    if north_up:
+        map1 = map1.rotate(recenter=True)
+        map2 = map2.rotate(recenter=True)
+
+    # Workflow: convert to HPC first, then apply common XY shift, then FOV match.
+    if coord_mode == 'hpc':
+        map1 = _shift_hpc_map(map1, hpc_xy_shift)
+        map2 = _shift_hpc_map(map2, hpc_xy_shift)
+        
+    ny1, nx1 = map1.data.shape
+    ix0, ix1, iy0, iy1 = _crop_pixel_bounds(nx1, ny1, crop_fraction)
+    bl = map1.pixel_to_world(ix0 * u.pix, iy0 * u.pix)
+    tr = map1.pixel_to_world((ix1 - 1) * u.pix, (iy1 - 1) * u.pix)
+    try:
+        sub1 = map1.submap(bl, top_right=tr)
+    except Exception as e:
+        print(f'Warning: submap failed for image1 ({e}); using full map.')
+        sub1 = map1
+
+
+        
+    if match_fov:
+        try:
+            # Reproject model to the exact image1 submap grid to avoid panel offsets/gaps.
+            sub2 = map2.reproject_to(sub1.wcs)
+        except Exception as e:
+            print(f'Warning: reproject_to failed for image2 ({e}); using submap fallback.')
+            try:
+                sub2 = map2.submap(bl, top_right=tr)
+            except Exception:
+                sub2 = map2
+    else:
+        ny2, nx2 = map2.data.shape
+        jx0, jx1, jy0, jy1 = _crop_pixel_bounds(nx2, ny2, crop_fraction)
+        bl2 = map2.pixel_to_world(jx0 * u.pix, jy0 * u.pix)
+        tr2 = map2.pixel_to_world((jx1 - 1) * u.pix, (jy1 - 1) * u.pix)
+        sub2 = map2.submap(bl2, top_right=tr2)
+
+    freqstr = image_meta.get('freq', '')
+    freqstr_plot = freqstr[1:] if isinstance(freqstr, str) and freqstr.startswith('0') else freqstr
+    array_config = image_meta.get('array_config', '')
+    array_config_text = image_meta.get('array_config_text', None)
+    if array_config_text is None:
+        array_config_text = array_config
+    weighting_meta = image_meta.get('weighting', None)
+    weighting_explicit = image_meta.get('imaging_weighting', None)
+    uvrange_text = image_meta.get('uvrange', None)
+
+    def _infer_weighting_from_name(image_name):
+        name = os.path.basename(image_name).lower()
+        if 'uniform' in name:
+            return 'uniform'
+        if 'natural' in name:
+            return 'natural'
+        if 'briggs' in name or 'robust' in name:
+            return 'briggs'
+        return None
+
+    inferred_weighting = _infer_weighting_from_name(image1_filename)
+    if weighting_explicit is not None:
+        weighting = weighting_explicit
+    elif isinstance(weighting_meta, str) and ('<' in weighting_meta or '>' in weighting_meta):
+        weighting = inferred_weighting if inferred_weighting is not None else weighting_meta
+        if uvrange_text is None:
+            uvrange_text = weighting_meta
+    else:
+        weighting = weighting_meta if weighting_meta is not None else inferred_weighting
+
+    tsys = image_meta.get('tsys', None)
+    tant = image_meta.get('tant', None)
+    sigma_jy = image_meta.get('sigma_jy', None)
+    cal_error = image_meta.get('cal_error', None)
+    dur = image_meta.get('duration', None)
+    bandwidth = image_meta.get('bandwidth', None)
+
+    def _compact_array_cfg_label(cfg_text):
+        if not isinstance(cfg_text, str) or not cfg_text:
+            return cfg_text
+        base = os.path.basename(cfg_text.rstrip('/'))
+        if base.endswith('.cfg'):
+            base = base[:-4]
+        parts = base.split('_')
+        parts_lower = [s.lower() for s in parts]
+        if 'hybrid' in parts_lower and '120' in parts_lower:
+            remote_count = next((s[6:] for s in parts_lower if s.startswith('remote') and len(s) > 6), None)
+            range_token = next((s for s in parts_lower if s.startswith('r') and s.endswith('km') and '-' in s), None)
+            if remote_count and range_token:
+                range_label = range_token[1:].replace('km', ' km').replace('-', '–')
+                return f'Hybrid 120 + {remote_count} remote ({range_label})'
+            return 'Hybrid 120'
+        return base
+
+    array_config_text = _compact_array_cfg_label(array_config_text)
+
+    data1 = np.asarray(sub1.data, dtype=float)
+    data2 = np.asarray(sub2.data, dtype=float)
+
+    def _rms_from_corners(arr, box=20):
+        ny, nx = arr.shape
+        b = max(2, int(box))
+        b = min(b, ny // 2, nx // 2)
+        if b < 2:
+            return np.nan
+        corners = np.concatenate([
+            arr[:b, :b].ravel(),
+            arr[:b, -b:].ravel(),
+            arr[-b:, :b].ravel(),
+            arr[-b:, -b:].ravel(),
+        ])
+        corners = corners[np.isfinite(corners)]
+        if corners.size == 0:
+            return np.nan
+        return np.sqrt(np.nanmean(corners ** 2))
+
+
+    # Convert units to brightness temperature [K] to match the original plotting function.
+    bmaj = float(beam['major']['value'])
+    bmin = float(beam['minor']['value'])
+    jybm2k = 1.222e6 / (freqhz / 1e9) ** 2 / (bmaj * bmin)
+    bmaj2 = float(beam2['major']['value'])
+    bmin2 = float(beam2['minor']['value'])
+    jybm2k2 = 1.222e6 / (freqhz / 1e9) ** 2 / (bmaj2 * bmin2)
+
+    def _pix_jy_to_k_factor(smap):
+        try:
+            px = abs(smap.scale.axis1.to_value(u.arcsec / u.pix))
+            py = abs(smap.scale.axis2.to_value(u.arcsec / u.pix))
+        except Exception:
+            px = py = 1.0
+        return 1.222e6 / (freqhz / 1e9) ** 2 / ((px * py) / (np.pi / (4 * np.log(2))))
+
+    if bunit1 == 'jy/beam':
+        data1 = data1 * jybm2k
+    elif bunit1 == 'jy/pixel':
+        data1 = data1 * _pix_jy_to_k_factor(sub1)
+
+    if bunit2 == 'jy/beam':
+        data2 = data2 * jybm2k2
+    elif bunit2 == 'jy/pixel':
+        data2 = data2 * _pix_jy_to_k_factor(sub2)
+
+    try:
+        image_pixscale_x_arcsec = abs(sub1.scale.axis1.to_value(u.arcsec / u.pix))
+    except Exception:
+        image_pixscale_x_arcsec = 1.0
+    try:
+        image_pixscale_y_arcsec = abs(sub1.scale.axis2.to_value(u.arcsec / u.pix))
+    except Exception:
+        image_pixscale_y_arcsec = image_pixscale_x_arcsec
+
+    dx_pix = float(image_pixel_shift[0]) + float(image_arcsec_shift[0]) / image_pixscale_x_arcsec
+    dy_pix = float(image_pixel_shift[1]) + float(image_arcsec_shift[1]) / image_pixscale_y_arcsec
+    if not (np.isclose(dx_pix, 0.0) and np.isclose(dy_pix, 0.0)):
+        # Apply the manual image shift on the final comparison grid so the
+        # left-hand panel, contour overlay, and slit profiles stay consistent.
+        data1 = ndimage_shift(
+            data1,
+            shift=(dy_pix, dx_pix),
+            order=1,
+            mode='constant',
+            cval=0.0,
+            prefilter=False,
+        )
+
+    # Rebuild maps so plotting and colorbars are in K.
+    sub1 = sunpy.map.Map(data1, dict(sub1.meta))
+    sub2 = sunpy.map.Map(data2, dict(sub2.meta))
+
+    def _estimate_rms_outside_disk_or_border(pix, pixscale_arcsec):
+        ny, nx = pix.shape
+        ics_y = int(ny / 2)
+        ics_x = int(nx / 2)
+        rsun_arcsec = sun.angular_radius(reftime).to_value(u.arcsec)
+        radius_pix = int(rsun_arcsec * float(rms_mask_radius) / pixscale_arcsec)
+        yy, xx = np.ogrid[-ics_y:ny - ics_y, -ics_x:nx - ics_x]
+        disk_mask = (xx * xx + yy * yy) <= (radius_pix * radius_pix)
+        outside = np.where(~disk_mask, pix, np.nan)
+        rms = np.sqrt(np.nanmean(outside ** 2))
+        if np.isfinite(rms):
+            return rms
+        border = max(2, int(0.1 * min(ny, nx)))
+        border_vals = np.concatenate([
+            pix[:border, :].ravel(),
+            pix[-border:, :].ravel(),
+            pix[:, :border].ravel(),
+            pix[:, -border:].ravel(),
+        ])
+        border_vals = border_vals[np.isfinite(border_vals)]
+        if border_vals.size == 0:
+            return np.nan
+        print('Warning: off-disk mask has no valid pixels in model full-FOV; using border RMS fallback.')
+        return np.sqrt(np.nanmean(border_vals ** 2))
+
+    try:
+        pixscale_sub1 = abs(sub1.scale.axis1.to_value(u.arcsec / u.pix))
+    except Exception:
+        pixscale_sub1 = pixscale_x2
+    rms1 = _estimate_rms_outside_disk_or_border(data1, pixscale_sub1)
+    if not np.isfinite(rms1):
+        rms1 = _rms_from_corners(data1, image_rms_corner_size)
+    datamax1, datamin1 = np.nanmax(data1), np.nanmin(data1)
+    snr1 = datamax1 / rms1 if np.isfinite(rms1) and rms1 > 0 else np.nan
+
+    # Model stats use the FULL convolved model image (uncropped), following the original method.
+    pix2_model = np.array(pix2_full, dtype=float)
+    if bunit2 == 'jy/beam':
+        pix2_model *= jybm2k2
+    elif bunit2 == 'jy/pixel':
+        jypx2k2 = 1.222e6 / (freqhz / 1e9) ** 2 / ((pixscale_x2 * pixscale_y2) / (np.pi / (4 * np.log(2))))
+        pix2_model *= jypx2k2
+    rms2 = _estimate_rms_outside_disk_or_border(pix2_model, pixscale_x2)
+    datamax2 = np.nanmax(pix2_model)
+    datamin2 = np.nanmin(pix2_model)
+    snr2 = datamax2 / rms2 if np.isfinite(rms2) and rms2 > 0 else np.nan
+
+    if vmax is None:
+        vmax = 90
+    if vmin is None:
+        vmin = (-1000.0 / snr1) if (np.isfinite(snr1) and snr1 != 0) else 0.1
+
+    # Sigma conversion for annotation, same convention as original function.
+    sigma_tb = np.nan
+    sigma_tb2 = np.nan
+    if sigma_jy is not None:
+        try:
+            sigma_tb = float(str(sigma_jy).rstrip('Jy/beam')) * jybm2k
+        except Exception:
+            sigma_tb = np.nan
+        try:
+            sigma_tb2 = float(str(sigma_jy).rstrip('Jy/beam')) * jybm2k2
+        except Exception:
+            sigma_tb2 = np.nan
+
+    print(f'Peak of {os.path.basename(image1_filename)}: {datamax1:.3e} K')
+    print(f'rms of {os.path.basename(image1_filename)} (off-disk/border): {rms1:.3e} K')
+    print(f'Peak of {os.path.basename(image2_filename)}: {datamax2:.3e} K')
+    print(f'rms of {os.path.basename(image2_filename)} (off-disk): {rms2:.3e} K')
+
+    def _build_common_norm(data_ref, vmin_pct, vmax_pct, use_log,
+                           vmin_abs=None, vmax_abs=None):
+        peak_ref = np.nanmax(data_ref)
+        if vmin_abs is not None and vmax_abs is not None:
+            vmin_val = float(vmin_abs)
+            vmax_val = float(vmax_abs)
+        else:
+            vmin_val = peak_ref * float(vmin_pct) / 100.0
+            vmax_val = peak_ref * float(vmax_pct) / 100.0
+        if use_log:
+            pos_ref = data_ref[np.isfinite(data_ref) & (data_ref > 0)]
+            if pos_ref.size > 0:
+                vmin_val = max(vmin_val, np.nanmin(pos_ref))
+                vmax_val = max(vmax_val, vmin_val * (1.0 + 1e-6))
+                return LogNorm(vmin=vmin_val, vmax=vmax_val), vmin_val, vmax_val
+            print('log_scale=True but image has no positive pixels; using linear scale instead.')
+        if vmax_val <= vmin_val:
+            vmax_val = vmin_val + np.finfo(float).eps
+        return Normalize(vmin=vmin_val, vmax=vmax_val), vmin_val, vmax_val
+
+    # Use one shared color scale for image+model, following the same percent-of-peak mechanism.
+    common_data = np.concatenate([
+        data1[np.isfinite(data1)].ravel(),
+        data2[np.isfinite(data2)].ravel(),
+    ])
+    if common_data.size == 0:
+        common_data = np.array([1.0])
+    norm_common, vmin_val, vmax_val = _build_common_norm(
+        common_data, vmin, vmax, log_scale,
+        vmin_abs=norm_vmin_abs, vmax_abs=norm_vmax_abs
+    )
+    norm1 = norm_common
+    norm2 = norm_common
+    print(f'Plotting both panels with shared vmin={vmin_val:.3e} K, vmax={vmax_val:.3e} K')
+
+    if return_prepared:
+        return {
+            'sub1': sub1,
+            'sub2': sub2,
+            'data1': data1,
+            'data2': data2,
+            'beam': beam,
+            'beam2': beam2,
+            'title1': title1,
+            'title2': title2,
+            'freqstr_plot': freqstr_plot,
+            'array_config_text': array_config_text,
+            'weighting': weighting,
+            'uvrange_text': uvrange_text,
+            'tsys': tsys,
+            'tant': tant,
+            'sigma_jy': sigma_jy,
+            'sigma_tb': sigma_tb,
+            'sigma_tb2': sigma_tb2,
+            'cal_error': cal_error,
+            'dur': dur,
+            'bandwidth': bandwidth,
+            'datamin1': datamin1,
+            'datamax1': datamax1,
+            'rms1': rms1,
+            'snr1': snr1,
+            'datamin2': datamin2,
+            'datamax2': datamax2,
+            'rms2': rms2,
+            'snr2': snr2,
+            'right_panel_is_image': (not convolve_model),
+            'image_arcsec_shift': tuple(float(v) for v in image_arcsec_shift),
+            'image_pixel_shift': (dx_pix, dy_pix),
+            'norm_vmin': vmin_val,
+            'norm_vmax': vmax_val,
+        }
+
+
+def measure_casa_image_model_offset_sunpy(image1_filename, image2_filename,
+                                          crop_fraction=(0.0, 1.0), reftime=None,
+                                          image_meta=None,
+                                          conv_tag='',
+                                          overwrite_conv=True,
+                                          convolve_model=True,
+                                          overwrite_fits=True,
+                                          coord_frame='hpc',
+                                          match_fov=True,
+                                          align_model_time_to_image=True,
+                                          north_up=False,
+                                          apply_hpc_p_angle=False,
+                                          anchor_model_wcs_to_image=False,
+                                          use_reftime_for_hpc=True,
+                                          hpc_reference_xy=None,
+                                          force_hpc_origin_at_image_center=False,
+                                          hpc_xy_shift=(0.0, 0.0),
+                                          rms_mask_radius=1.2,
+                                          image_rms_corner_size=20,
+                                          offset_threshold_percent=20.0,
+                                          focus_box=None,
+                                          peak_box_size_px=21,
+                                          return_debug_arrays=False):
+    """Measure image-to-model spatial offset on the SunPy comparison grid.
+
+    The returned shifts are the pixel/arcsec offsets that should be applied to
+    the model image to align it with the reference image on the prepared grid.
+    Positive ``shift_x_pix`` means shifting the model toward larger x-pixel
+    index on the displayed array; positive ``shift_y_pix`` means toward larger
+    y-pixel index.
+
+    :param image1_filename: Reference CASA image path.
+    :type image1_filename: str
+    :param image2_filename: Model CASA image path.
+    :type image2_filename: str
+    :param crop_fraction: Crop definition passed through to the SunPy prep path.
+    :type crop_fraction: tuple
+    :param reftime: Observation reference time for HPC conversion.
+    :type reftime: astropy.time.Time or str or None
+    :param image_meta: Optional metadata dict containing at least ``freq`` when
+        available.
+    :type image_meta: dict or None
+    :param conv_tag: Tag appended to the convolved CASA image name.
+    :type conv_tag: str
+    :param overwrite_conv: If True, recompute convolved image2.
+    :type overwrite_conv: bool
+    :param convolve_model: If True, convolve ``image2`` to the restoring beam
+        of ``image1`` before measurement.
+    :type convolve_model: bool
+    :param overwrite_fits: If True, overwrite exported FITS intermediates.
+    :type overwrite_fits: bool
+    :param coord_frame: Output plotting frame, either ``'radec'`` or ``'hpc'``.
+    :type coord_frame: str
+    :param match_fov: If True, reproject the model to the image grid first.
+    :type match_fov: bool
+    :param align_model_time_to_image: If True, force model-map time metadata to
+        match the image-map time.
+    :type align_model_time_to_image: bool
+    :param north_up: If True, rotate map data to solar north up.
+    :type north_up: bool
+    :param apply_hpc_p_angle: If True, apply ``-sun.P(obstime)`` in the HPC
+        header construction.
+    :type apply_hpc_p_angle: bool
+    :param anchor_model_wcs_to_image: If True, replace model-map WCS metadata
+        with image-map WCS metadata after conversion.
+    :type anchor_model_wcs_to_image: bool
+    :param use_reftime_for_hpc: If True, force RA/Dec->HPC conversion obstime to
+        use ``reftime`` for both maps instead of FITS DATE-OBS.
+    :type use_reftime_for_hpc: bool
+    :param hpc_reference_xy: Optional fixed HPC reference center ``(x, y)`` in
+        arcsec.
+    :type hpc_reference_xy: tuple or None
+    :param force_hpc_origin_at_image_center: If True, fix the HPC reference
+        pixel at image center.
+    :type force_hpc_origin_at_image_center: bool
+    :param hpc_xy_shift: Common post-conversion shift ``(dx, dy)`` in arcsec.
+    :type hpc_xy_shift: tuple
+    :param rms_mask_radius: Radius factor used in off-disk RMS estimation.
+    :type rms_mask_radius: float
+    :param image_rms_corner_size: Corner-box size used for RMS fallback.
+    :type image_rms_corner_size: int
+    :param offset_threshold_percent: Keep only pixels above this fraction of
+        each image peak before correlation. Set to None to disable thresholding.
+    :type offset_threshold_percent: float or None
+    :param focus_box: Optional fractional ROI ``((x0, x1), (y0, y1))`` on the
+        prepared comparison grid. Use this to isolate the flare core and avoid
+        large-scale morphology differences dominating the registration.
+    :type focus_box: tuple or None
+    :param peak_box_size_px: Size of the square box used for peak-core centroid
+        measurement around each image maximum.
+    :type peak_box_size_px: int
+    :param return_debug_arrays: If True, include the thresholded arrays and
+        correlation surface in the returned dict.
+    :type return_debug_arrays: bool
+    :returns: Offset diagnostics for one image/model pair.
+    :rtype: dict
+    """
+    image_meta = {} if image_meta is None else dict(image_meta)
+    prepared = plot_two_casa_images_with_convolution_sunpy(
+        image1_filename,
+        image2_filename,
+        crop_fraction=crop_fraction,
+        reftime=reftime,
+        image_meta=image_meta,
+        conv_tag=conv_tag,
+        overwrite_conv=overwrite_conv,
+        convolve_model=convolve_model,
+        overwrite_fits=overwrite_fits,
+        coord_frame=coord_frame,
+        match_fov=match_fov,
+        align_model_time_to_image=align_model_time_to_image,
+        north_up=north_up,
+        apply_hpc_p_angle=apply_hpc_p_angle,
+        anchor_model_wcs_to_image=anchor_model_wcs_to_image,
+        use_reftime_for_hpc=use_reftime_for_hpc,
+        hpc_reference_xy=hpc_reference_xy,
+        force_hpc_origin_at_image_center=force_hpc_origin_at_image_center,
+        hpc_xy_shift=hpc_xy_shift,
+        rms_mask_radius=rms_mask_radius,
+        image_rms_corner_size=image_rms_corner_size,
+        return_prepared=True,
+    )
+
+    data_img = np.asarray(prepared['data1'], dtype=float)
+    data_model = np.asarray(prepared['data2'], dtype=float)
+
+    def _focus_slices(shape, roi):
+        ny, nx = shape
+        if roi is None:
+            return slice(0, ny), slice(0, nx)
+        (x0f, x1f), (y0f, y1f) = roi
+        x0 = max(0, min(nx - 1, int(np.floor(nx * float(x0f)))))
+        x1 = max(x0 + 1, min(nx, int(np.ceil(nx * float(x1f)))))
+        y0 = max(0, min(ny - 1, int(np.floor(ny * float(y0f)))))
+        y1 = max(y0 + 1, min(ny, int(np.ceil(ny * float(y1f)))))
+        return slice(y0, y1), slice(x0, x1)
+
+    yslice, xslice = _focus_slices(data_img.shape, focus_box)
+    data_img_focus = data_img[yslice, xslice]
+    data_model_focus = data_model[yslice, xslice]
+
+    def _prepare_for_offset(arr):
+        work = np.nan_to_num(np.asarray(arr, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        finite = work[np.isfinite(work)]
+        if finite.size == 0:
+            raise ValueError('Offset measurement received an empty image')
+        work = work - np.nanpercentile(finite, 5.0)
+        work = np.clip(work, 0.0, None)
+        peak = np.nanmax(work)
+        if not np.isfinite(peak) or peak <= 0:
+            raise ValueError('Offset measurement image has no positive signal after background subtraction')
+        if offset_threshold_percent is not None:
+            cutoff = peak * float(offset_threshold_percent) / 100.0
+            work = np.where(work >= cutoff, work, 0.0)
+        total = np.nansum(work)
+        if not np.isfinite(total) or total <= 0:
+            raise ValueError('Offset measurement threshold removed all signal; lower offset_threshold_percent')
+        return work / total
+
+    def _quadratic_peak_offset(arr, peak_idx):
+        offsets = []
+        for axis, idx in enumerate(peak_idx):
+            if idx <= 0 or idx >= arr.shape[axis] - 1:
+                offsets.append(0.0)
+                continue
+            slicer = list(peak_idx)
+            slicer[axis] = idx - 1
+            fm1 = float(arr[tuple(slicer)])
+            slicer[axis] = idx
+            f0 = float(arr[tuple(slicer)])
+            slicer[axis] = idx + 1
+            fp1 = float(arr[tuple(slicer)])
+            denom = fm1 - 2.0 * f0 + fp1
+            if np.isclose(denom, 0.0):
+                offsets.append(0.0)
+            else:
+                delta = 0.5 * (fm1 - fp1) / denom
+                offsets.append(float(np.clip(delta, -1.0, 1.0)))
+        return np.array(offsets, dtype=float)
+
+    def _weighted_centroid(arr):
+        yy, xx = np.indices(arr.shape, dtype=float)
+        total = np.nansum(arr)
+        if not np.isfinite(total) or total <= 0:
+            return np.array([np.nan, np.nan], dtype=float)
+        cy = np.nansum(yy * arr) / total
+        cx = np.nansum(xx * arr) / total
+        return np.array([cy, cx], dtype=float)
+
+    def _peak_location(arr):
+        peak_idx_int = np.array(np.unravel_index(np.nanargmax(arr), arr.shape), dtype=int)
+        return peak_idx_int.astype(float) + _quadratic_peak_offset(arr, peak_idx_int)
+
+    def _local_peak_centroid(arr, peak_yx, box_size):
+        half = max(1, int(box_size) // 2)
+        py = int(round(float(peak_yx[0])))
+        px = int(round(float(peak_yx[1])))
+        y0 = max(0, py - half)
+        y1 = min(arr.shape[0], py + half + 1)
+        x0 = max(0, px - half)
+        x1 = min(arr.shape[1], px + half + 1)
+        sub = np.array(arr[y0:y1, x0:x1], dtype=float)
+        sub = np.nan_to_num(sub, nan=0.0, posinf=0.0, neginf=0.0)
+        sub = sub - np.nanmin(sub)
+        sub = np.clip(sub, 0.0, None)
+        centroid_local = _weighted_centroid(sub)
+        return np.array([y0, x0], dtype=float) + centroid_local
+
+    img_work = _prepare_for_offset(data_img_focus)
+    model_work = _prepare_for_offset(data_model_focus)
+
+    corr = fftconvolve(img_work, model_work[::-1, ::-1], mode='same')
+    peak_idx_int = np.array(np.unravel_index(np.nanargmax(corr), corr.shape), dtype=int)
+    peak_idx = peak_idx_int.astype(float) + _quadratic_peak_offset(corr, peak_idx_int)
+    center_idx = 0.5 * (np.array(corr.shape, dtype=float) - 1.0)
+    shift_yx_pix = peak_idx - center_idx
+
+    centroid_img_yx = _weighted_centroid(img_work)
+    centroid_model_yx = _weighted_centroid(model_work)
+    centroid_shift_yx_pix = centroid_img_yx - centroid_model_yx
+    peak_img_yx_pix = _peak_location(data_img_focus)
+    peak_model_yx_pix = _peak_location(data_model_focus)
+    peak_shift_yx_pix = peak_img_yx_pix - peak_model_yx_pix
+    core_img_yx_pix = _local_peak_centroid(data_img_focus, peak_img_yx_pix, peak_box_size_px)
+    core_model_yx_pix = _local_peak_centroid(data_model_focus, peak_model_yx_pix, peak_box_size_px)
+    core_shift_yx_pix = core_img_yx_pix - core_model_yx_pix
+
+    try:
+        pixscale_x_arcsec = abs(prepared['sub1'].scale.axis1.to_value(u.arcsec / u.pix))
+    except Exception:
+        pixscale_x_arcsec = 1.0
+    try:
+        pixscale_y_arcsec = abs(prepared['sub1'].scale.axis2.to_value(u.arcsec / u.pix))
+    except Exception:
+        pixscale_y_arcsec = pixscale_x_arcsec
+
+    result = {
+        'freq': image_meta.get('freq', prepared.get('freqstr_plot', '')),
+        'image_path': str(image1_filename),
+        'model_path': str(image2_filename),
+        'shift_x_pix': float(shift_yx_pix[1]),
+        'shift_y_pix': float(shift_yx_pix[0]),
+        'shift_x_arcsec': float(shift_yx_pix[1] * pixscale_x_arcsec),
+        'shift_y_arcsec': float(shift_yx_pix[0] * pixscale_y_arcsec),
+        'shift_r_arcsec': float(np.hypot(shift_yx_pix[1] * pixscale_x_arcsec,
+                                         shift_yx_pix[0] * pixscale_y_arcsec)),
+        'centroid_shift_x_pix': float(centroid_shift_yx_pix[1]),
+        'centroid_shift_y_pix': float(centroid_shift_yx_pix[0]),
+        'centroid_shift_x_arcsec': float(centroid_shift_yx_pix[1] * pixscale_x_arcsec),
+        'centroid_shift_y_arcsec': float(centroid_shift_yx_pix[0] * pixscale_y_arcsec),
+        'centroid_shift_r_arcsec': float(np.hypot(centroid_shift_yx_pix[1] * pixscale_x_arcsec,
+                                                  centroid_shift_yx_pix[0] * pixscale_y_arcsec)),
+        'peak_shift_x_pix': float(peak_shift_yx_pix[1]),
+        'peak_shift_y_pix': float(peak_shift_yx_pix[0]),
+        'peak_shift_x_arcsec': float(peak_shift_yx_pix[1] * pixscale_x_arcsec),
+        'peak_shift_y_arcsec': float(peak_shift_yx_pix[0] * pixscale_y_arcsec),
+        'peak_shift_r_arcsec': float(np.hypot(peak_shift_yx_pix[1] * pixscale_x_arcsec,
+                                              peak_shift_yx_pix[0] * pixscale_y_arcsec)),
+        'core_shift_x_pix': float(core_shift_yx_pix[1]),
+        'core_shift_y_pix': float(core_shift_yx_pix[0]),
+        'core_shift_x_arcsec': float(core_shift_yx_pix[1] * pixscale_x_arcsec),
+        'core_shift_y_arcsec': float(core_shift_yx_pix[0] * pixscale_y_arcsec),
+        'core_shift_r_arcsec': float(np.hypot(core_shift_yx_pix[1] * pixscale_x_arcsec,
+                                              core_shift_yx_pix[0] * pixscale_y_arcsec)),
+        'offset_threshold_percent': offset_threshold_percent,
+        'focus_box': focus_box,
+        'correlation_peak': float(np.nanmax(corr)),
+        'pixscale_x_arcsec': float(pixscale_x_arcsec),
+        'pixscale_y_arcsec': float(pixscale_y_arcsec),
+    }
+    if return_debug_arrays:
+        result['image_work'] = img_work
+        result['model_work'] = model_work
+        result['correlation'] = corr
+        result['image_focus'] = data_img_focus
+        result['model_focus'] = data_model_focus
+    return result
+
+
+def measure_casa_image_model_offsets_sunpy(image1_filenames, image2_filenames,
+                                           freq_labels=None,
+                                           image_meta_list=None,
+                                           **kwargs):
+    """Measure image-to-model offsets for multiple frequency/image pairs.
+
+    :param image1_filenames: Reference CASA image paths.
+    :type image1_filenames: list[str] or tuple[str]
+    :param image2_filenames: Model CASA image paths, or a single shared path.
+    :type image2_filenames: list[str] or tuple[str] or str
+    :param freq_labels: Optional frequency labels used in the results.
+    :type freq_labels: list[str] or tuple[str] or None
+    :param image_meta_list: Optional list of metadata dicts parallel to
+        ``image1_filenames``.
+    :type image_meta_list: list[dict] or tuple[dict] or None
+    :param kwargs: Forwarded to :func:`measure_casa_image_model_offset_sunpy`.
+    :type kwargs: dict
+    :returns: Offset diagnostics for all pairs.
+    :rtype: list[dict]
+    """
+    image1_list = list(image1_filenames)
+    if isinstance(image2_filenames, str):
+        image2_list = [image2_filenames] * len(image1_list)
+    else:
+        image2_list = list(image2_filenames)
+    if len(image1_list) != len(image2_list):
+        raise ValueError('image1_filenames and image2_filenames must have the same length')
+    if freq_labels is not None and len(freq_labels) != len(image1_list):
+        raise ValueError('freq_labels must match image1_filenames length')
+    if image_meta_list is not None and len(image_meta_list) != len(image1_list):
+        raise ValueError('image_meta_list must match image1_filenames length')
+
+    results = []
+    for idx, (image_path, model_path) in enumerate(zip(image1_list, image2_list)):
+        meta_local = {}
+        if image_meta_list is not None and image_meta_list[idx] is not None:
+            meta_local.update(dict(image_meta_list[idx]))
+        if freq_labels is not None:
+            meta_local.setdefault('freq', freq_labels[idx])
+        result = measure_casa_image_model_offset_sunpy(
+            image_path,
+            model_path,
+            image_meta=meta_local,
+            **kwargs,
+        )
+        if freq_labels is not None:
+            result['freq'] = freq_labels[idx]
+        results.append(result)
+    return results
+
+
+def debug_casa_image_model_registration_sunpy(image1_filename, image2_filename,
+                                              crop_fraction=(0.0, 1.0), reftime=None,
+                                              image_meta=None,
+                                              conv_tag='',
+                                              overwrite_conv=True,
+                                              convolve_model=True,
+                                              overwrite_fits=True,
+                                              coord_frame='hpc',
+                                              match_fov=True,
+                                              align_model_time_to_image=True,
+                                              north_up=False,
+                                              apply_hpc_p_angle=False,
+                                              anchor_model_wcs_to_image=False,
+                                              use_reftime_for_hpc=True,
+                                              hpc_reference_xy=None,
+                                              force_hpc_origin_at_image_center=False,
+                                              hpc_xy_shift=(0.0, 0.0)):
+    """Return peak-location and beam diagnostics for one image/model pair.
+
+    :param image1_filename: Reference CASA image path.
+    :type image1_filename: str
+    :param image2_filename: Model CASA image path.
+    :type image2_filename: str
+    :param crop_fraction: Crop definition passed through to the SunPy prep path.
+    :type crop_fraction: tuple
+    :param reftime: Observation reference time for HPC conversion.
+    :type reftime: astropy.time.Time or str or None
+    :param image_meta: Optional metadata dict containing at least ``freq``.
+    :type image_meta: dict or None
+    :returns: Registration diagnostics including peak world coordinates and
+        offset-to-beam ratios.
+    :rtype: dict
+    """
+    image_meta = {} if image_meta is None else dict(image_meta)
+    prepared = plot_two_casa_images_with_convolution_sunpy(
+        image1_filename,
+        image2_filename,
+        crop_fraction=crop_fraction,
+        reftime=reftime,
+        image_meta=image_meta,
+        conv_tag=conv_tag,
+        overwrite_conv=overwrite_conv,
+        convolve_model=convolve_model,
+        overwrite_fits=overwrite_fits,
+        coord_frame=coord_frame,
+        match_fov=match_fov,
+        align_model_time_to_image=align_model_time_to_image,
+        north_up=north_up,
+        apply_hpc_p_angle=apply_hpc_p_angle,
+        anchor_model_wcs_to_image=anchor_model_wcs_to_image,
+        use_reftime_for_hpc=use_reftime_for_hpc,
+        hpc_reference_xy=hpc_reference_xy,
+        force_hpc_origin_at_image_center=force_hpc_origin_at_image_center,
+        hpc_xy_shift=hpc_xy_shift,
+        return_prepared=True,
+    )
+
+    def _peak_location(arr):
+        peak_idx = np.array(np.unravel_index(np.nanargmax(arr), arr.shape), dtype=float)
+        return peak_idx
+
+    data1 = np.asarray(prepared['data1'], dtype=float)
+    data2 = np.asarray(prepared['data2'], dtype=float)
+    peak1_yx = _peak_location(data1)
+    peak2_yx = _peak_location(data2)
+
+    world1 = prepared['sub1'].pixel_to_world(peak1_yx[1] * u.pix, peak1_yx[0] * u.pix)
+    world2 = prepared['sub2'].pixel_to_world(peak2_yx[1] * u.pix, peak2_yx[0] * u.pix)
+
+    def _world_xy_arcsec(world_a, world_b):
+        try:
+            xa = world_a.Tx.to_value(u.arcsec)
+            ya = world_a.Ty.to_value(u.arcsec)
+            xb = world_b.Tx.to_value(u.arcsec)
+            yb = world_b.Ty.to_value(u.arcsec)
+            dx = xa - xb
+            dy = ya - yb
+            return xa, ya, xb, yb, dx, dy
+        except Exception:
+            pass
+        try:
+            ra_a = world_a.ra.to(u.arcsec)
+            dec_a = world_a.dec.to(u.arcsec)
+            ra_b = world_b.ra.to(u.arcsec)
+            dec_b = world_b.dec.to(u.arcsec)
+            dra, ddec = world_b.spherical_offsets_to(world_a)
+            dx = dra.to_value(u.arcsec)
+            dy = ddec.to_value(u.arcsec)
+            return ra_a.value, dec_a.value, ra_b.value, dec_b.value, dx, dy
+        except Exception:
+            return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+
+    tx1, ty1, tx2, ty2, dx_arcsec, dy_arcsec = _world_xy_arcsec(world1, world2)
+
+    bmaj1 = float(prepared['beam']['major']['value'])
+    bmin1 = float(prepared['beam']['minor']['value'])
+    bmaj2 = float(prepared['beam2']['major']['value'])
+    bmin2 = float(prepared['beam2']['minor']['value'])
+    beam_ref_arcsec = np.sqrt(max(bmaj1, 0.0) * max(bmin1, 0.0))
+    offset_r_arcsec = float(np.hypot(dx_arcsec, dy_arcsec))
+
+    return {
+        'freq': image_meta.get('freq', prepared.get('freqstr_plot', '')),
+        'image_path': str(image1_filename),
+        'model_path': str(image2_filename),
+        'image_peak_x_pix': float(peak1_yx[1]),
+        'image_peak_y_pix': float(peak1_yx[0]),
+        'model_peak_x_pix': float(peak2_yx[1]),
+        'model_peak_y_pix': float(peak2_yx[0]),
+        'image_peak_tx_arcsec': float(tx1),
+        'image_peak_ty_arcsec': float(ty1),
+        'model_peak_tx_arcsec': float(tx2),
+        'model_peak_ty_arcsec': float(ty2),
+        'peak_dx_arcsec': float(dx_arcsec),
+        'peak_dy_arcsec': float(dy_arcsec),
+        'peak_r_arcsec': offset_r_arcsec,
+        'beam1_bmaj_arcsec': bmaj1,
+        'beam1_bmin_arcsec': bmin1,
+        'beam2_bmaj_arcsec': bmaj2,
+        'beam2_bmin_arcsec': bmin2,
+        'offset_over_geom_beam': float(offset_r_arcsec / beam_ref_arcsec) if beam_ref_arcsec > 0 else np.nan,
+        'sub1_crval1': float(prepared['sub1'].meta.get('crval1', np.nan)),
+        'sub1_crval2': float(prepared['sub1'].meta.get('crval2', np.nan)),
+        'sub2_crval1': float(prepared['sub2'].meta.get('crval1', np.nan)),
+        'sub2_crval2': float(prepared['sub2'].meta.get('crval2', np.nan)),
+    }
+
+
+def measure_casa_image_model_contour_offset_sunpy(image1_filename, image2_filename,
+                                                  crop_fraction=(0.0, 1.0), reftime=None,
+                                                  image_meta=None,
+                                                  conv_tag='',
+                                                  overwrite_conv=True,
+                                                  convolve_model=True,
+                                                  overwrite_fits=True,
+                                                  coord_frame='radec',
+                                                  match_fov=True,
+                                                  align_model_time_to_image=True,
+                                                  north_up=False,
+                                                  apply_hpc_p_angle=False,
+                                                  anchor_model_wcs_to_image=False,
+                                                  use_reftime_for_hpc=True,
+                                                  hpc_reference_xy=None,
+                                                  force_hpc_origin_at_image_center=False,
+                                                  hpc_xy_shift=(0.0, 0.0),
+                                                  contour_percent=70.0,
+                                                  focus_box=None):
+    """Measure offset from contour-mask centroids on the prepared comparison grid.
+
+    This is intended to match what is visually apparent in an overlaid contour
+    plot more closely than a pure peak or full-image correlation metric.
+
+    :param image1_filename: Reference CASA image path.
+    :type image1_filename: str
+    :param image2_filename: Model CASA image path.
+    :type image2_filename: str
+    :param contour_percent: Mask threshold as a percent of each image peak.
+    :type contour_percent: float
+    :param focus_box: Optional fractional ROI ``((x0, x1), (y0, y1))`` on the
+        prepared comparison grid.
+    :type focus_box: tuple or None
+    :returns: Contour-centroid offset diagnostics.
+    :rtype: dict
+    """
+    image_meta = {} if image_meta is None else dict(image_meta)
+    prepared = plot_two_casa_images_with_convolution_sunpy(
+        image1_filename,
+        image2_filename,
+        crop_fraction=crop_fraction,
+        reftime=reftime,
+        image_meta=image_meta,
+        conv_tag=conv_tag,
+        overwrite_conv=overwrite_conv,
+        convolve_model=convolve_model,
+        overwrite_fits=overwrite_fits,
+        coord_frame=coord_frame,
+        match_fov=match_fov,
+        align_model_time_to_image=align_model_time_to_image,
+        north_up=north_up,
+        apply_hpc_p_angle=apply_hpc_p_angle,
+        anchor_model_wcs_to_image=anchor_model_wcs_to_image,
+        use_reftime_for_hpc=use_reftime_for_hpc,
+        hpc_reference_xy=hpc_reference_xy,
+        force_hpc_origin_at_image_center=force_hpc_origin_at_image_center,
+        hpc_xy_shift=hpc_xy_shift,
+        return_prepared=True,
+    )
+
+    data1 = np.asarray(prepared['data1'], dtype=float)
+    data2 = np.asarray(prepared['data2'], dtype=float)
+
+    def _focus_slices(shape, roi):
+        ny, nx = shape
+        if roi is None:
+            return slice(0, ny), slice(0, nx)
+        (x0f, x1f), (y0f, y1f) = roi
+        x0 = max(0, min(nx - 1, int(np.floor(nx * float(x0f)))))
+        x1 = max(x0 + 1, min(nx, int(np.ceil(nx * float(x1f)))))
+        y0 = max(0, min(ny - 1, int(np.floor(ny * float(y0f)))))
+        y1 = max(y0 + 1, min(ny, int(np.ceil(ny * float(y1f)))))
+        return slice(y0, y1), slice(x0, x1)
+
+    yslice, xslice = _focus_slices(data1.shape, focus_box)
+    arr1 = data1[yslice, xslice]
+    arr2 = data2[yslice, xslice]
+
+    def _mask_centroid(arr, level_pct):
+        arr = np.nan_to_num(np.asarray(arr, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        peak = np.nanmax(arr)
+        if not np.isfinite(peak) or peak <= 0:
+            return np.array([np.nan, np.nan], dtype=float), np.zeros_like(arr, dtype=bool)
+        cutoff = peak * float(level_pct) / 100.0
+        mask = arr >= cutoff
+        if not np.any(mask):
+            return np.array([np.nan, np.nan], dtype=float), mask
+        yy, xx = np.indices(arr.shape, dtype=float)
+        weights = np.where(mask, arr, 0.0)
+        total = np.nansum(weights)
+        cy = np.nansum(yy * weights) / total
+        cx = np.nansum(xx * weights) / total
+        return np.array([cy, cx], dtype=float), mask
+
+    ctr1_yx, mask1 = _mask_centroid(arr1, contour_percent)
+    ctr2_yx, mask2 = _mask_centroid(arr2, contour_percent)
+    shift_yx_pix = ctr1_yx - ctr2_yx
+
+    try:
+        pixscale_x_arcsec = abs(prepared['sub1'].scale.axis1.to_value(u.arcsec / u.pix))
+    except Exception:
+        pixscale_x_arcsec = 1.0
+    try:
+        pixscale_y_arcsec = abs(prepared['sub1'].scale.axis2.to_value(u.arcsec / u.pix))
+    except Exception:
+        pixscale_y_arcsec = pixscale_x_arcsec
+
+    return {
+        'freq': image_meta.get('freq', prepared.get('freqstr_plot', '')),
+        'image_path': str(image1_filename),
+        'model_path': str(image2_filename),
+        'contour_percent': float(contour_percent),
+        'focus_box': focus_box,
+        'contour_shift_x_pix': float(shift_yx_pix[1]),
+        'contour_shift_y_pix': float(shift_yx_pix[0]),
+        'contour_shift_x_arcsec': float(shift_yx_pix[1] * pixscale_x_arcsec),
+        'contour_shift_y_arcsec': float(shift_yx_pix[0] * pixscale_y_arcsec),
+        'contour_shift_r_arcsec': float(np.hypot(shift_yx_pix[1] * pixscale_x_arcsec,
+                                                 shift_yx_pix[0] * pixscale_y_arcsec)),
+        'image_mask_npix': int(np.count_nonzero(mask1)),
+        'model_mask_npix': int(np.count_nonzero(mask2)),
+    }
 
 @runtime_report
 def plot_two_casa_images0(image1_filename, image2_filename,
